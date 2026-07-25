@@ -1,0 +1,89 @@
+platform:
+  embedding_model: "intfloat/multilingual-e5-large"
+  
+validation:
+  allowed_objects:
+    - "pg-billing-prod"
+    - "pg-crm-prod"
+    - "pg-auth-stage"
+    - "pg-analytics-test"
+    - "pg-warehouse-prod"
+    - "pg-orders-prod"
+    - "pg-users-stage"
+  allowed_object_types:
+    - "patroni_cluster"
+    - "postgres_standalone"
+    - "pgbouncer"
+    - "redis_sentinel"
+    - "mongodb_replica"
+  allowed_priorities:
+    - "low"
+    - "medium"
+    - "high"
+    - "critical"
+  allowed_actions:
+    - "os_upgrade"
+    - "ssl_renew"
+    - "compliance_audit"
+    - "backup_restore"
+    - "schema_migration"
+
+pipeline:
+  # Декларативное описание конвейера агентов и маршрутизации очередей.
+  # Для добавления нового агента: добавьте новый шаг с указанием входной и выходной очередей.
+  steps:
+    - name: parser
+      description: "Парсинг и валидация входящей заявки"
+      subscribe_queue: "q.tasks.raw"
+      publish_queue: "q.tasks.parsed"
+      enabled: true
+    - name: rag
+      description: "Обогащение задачи контекстом из базы знаний"
+      subscribe_queue: "q.tasks.parsed"
+      publish_queue: "q.tasks.ready_for_execution"
+      enabled: true
+    - name: executor
+      description: "Генерация, тестирование и исполнение скриптов"
+      subscribe_queue: "q.tasks.ready_for_execution"
+      publish_queue: "q.tasks.human_approval"
+      approval_queue: "q.tasks.execute_prod"
+      enabled: true
+
+agents:
+  parser:
+    prompt: |
+      Convert the input database administration (DBA) request into a strictly valid JSON object matching the required schema:
+      {
+        "priority": "low" | "medium" | "high" | "critical",
+        "action_type": "os_upgrade" | "ssl_renew" | "compliance_audit" | "backup_restore" | "schema_migration",
+        "object": "<target_object_id>",
+        "object_type": "patroni_cluster" | "postgres_standalone" | "pgbouncer" | "redis_sentinel" | "mongodb_replica",
+        "purpose": "<summary_purpose_statement>",
+        "subtasks": [
+          {"order": 1, "action": "<step_description>", "constraints": ["<constraint_1>"]}
+        ],
+        "sla_minutes": <number>,
+        "is_downtime": true | false
+      }
+
+      Allowed target objects: pg-billing-prod, pg-crm-prod, pg-auth-stage, pg-analytics-test, pg-warehouse-prod, pg-orders-prod, pg-users-stage.
+      Output ONLY valid JSON and nothing else.
+
+  rag:
+    chunk_size: 1000
+    chunk_overlap: 200
+    initial_candidates: 5
+    reranker_top_k: 2
+    reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    prompt: |
+      You are a Senior DBA Knowledge Base Retrieval Agent.
+      Formulate optimal search queries based on target database topology, operation type, and safety constraints to retrieve authoritative operational manuals, safety guidelines, and recovery procedures from ChromaDB.
+
+  executor:
+    max_retries: 3
+    prompt: |
+      You are an expert Principal Database Reliability Engineer (DBA).
+      Based on the structured task specification and retrieved RAG documentation guidelines,
+      generate a fully executable, self-contained Bash (/bin/sh) or SQL script to perform the requested maintenance.
+      Ensure all directories (such as /etc/pgbouncer) are safely created using `mkdir -p` before creating configuration files.
+      Return ONLY the code block enclosed in markdown ```bash or ```sql format.
