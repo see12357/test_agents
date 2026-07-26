@@ -1,6 +1,5 @@
 """
 Shared SQLite database functions for task and prompt persistence.
-Strictly PEP 8 compliant.
 """
 
 import json
@@ -8,16 +7,31 @@ import os
 import sqlite3
 from typing import Optional
 from shared.models import TaskEvent, ParseTaskResponse
+from shared.config import load_config
 
+_settings, _ = load_config()
 current_dir = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(os.path.dirname(current_dir), "executor.db")
+_default_db_filename = getattr(_settings, "db_path", "executor.db")
+
+if os.path.isabs(_default_db_filename):
+    DB_PATH = os.getenv("DB_PATH", _default_db_filename)
+else:
+    DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(current_dir), _default_db_filename))
+
+
+def get_db_connection() -> sqlite3.Connection:
+    """Returns an optimized SQLite connection with WAL journal mode and 30s timeout."""
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    return conn
 
 
 def init_db() -> None:
     """
     Initializes the database schemas for tasks and dynamic prompts.
     """
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute("""
@@ -67,7 +81,7 @@ def save_task(event: TaskEvent) -> None:
     Args:
         event (TaskEvent): Task event parameters.
     """
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     parsed_str = (
@@ -99,7 +113,7 @@ def get_task(task_id: str) -> Optional[TaskEvent]:
     Returns:
         Optional[TaskEvent]: Retrieved task if found.
     """
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
     row = cursor.fetchone()
@@ -140,7 +154,7 @@ def save_prompt(agent_name: str, prompt: str) -> None:
         agent_name (str): Name of the agent (e.g. parser, executor).
         prompt (str): Prompt text.
     """
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT OR REPLACE INTO prompts (agent_name, prompt) VALUES (?, ?)",
@@ -160,7 +174,7 @@ def get_prompt(agent_name: str, default_prompt: str) -> str:
         str: Active prompt string.
     """
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT prompt FROM prompts WHERE agent_name = ?", (agent_name,))
         row = cursor.fetchone()

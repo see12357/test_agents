@@ -1,6 +1,5 @@
 """
 Unified LLM Provider Initializer for DeepSeek Cloud and Sber GigaChat API.
-Strictly PEP 8 compliant.
 """
 
 import logging
@@ -19,22 +18,22 @@ logger = logging.getLogger("LLMProvider")
 
 class GigaChatAuth(httpx.Auth):
     """
-    HTTPX Auth handler that automatically fetches and refreshes
-    Sber GigaChat OAuth access tokens before expiration.
+    Custom HTTPX Auth class for GigaChat OAuth token management.
     """
-    def __init__(self, credentials: str, scope: str = "GIGACHAT_API_PERS", verify_ssl: bool = False):
+    def __init__(self, credentials: str, scope: str = "GIGACHAT_API_PERS", verify_ssl: bool = False, auth_url: str = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth", timeout: float = 45.0):
         self.credentials = credentials
         self.scope = scope
         self.verify_ssl = verify_ssl
-        self.token = None
-        self.expires_at = 0
+        self.auth_url = auth_url
+        self.timeout = timeout
+        self.token = ""
+        self.expires_at = 0.0
 
     def get_token(self) -> str:
         now = time.time()
         if self.token and self.expires_at > now + 60:
             return self.token
 
-        auth_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
@@ -43,11 +42,11 @@ class GigaChatAuth(httpx.Auth):
         }
         payload = {"scope": self.scope}
         resp = requests.post(
-            auth_url,
+            self.auth_url,
             headers=headers,
             data=payload,
             verify=self.verify_ssl,
-            timeout=15
+            timeout=self.timeout
         )
         resp.raise_for_status()
         data = resp.json()
@@ -59,7 +58,7 @@ class GigaChatAuth(httpx.Auth):
         else:
             self.expires_at = expires_at_ms if expires_at_ms > 0 else now + 1750.0
 
-        logger.info(f"Refreshed GigaChat OAuth token (valid for ~30m)")
+        logger.info("Refreshed GigaChat OAuth token (valid for ~30m)")
         return self.token
 
     def sync_auth_flow(self, request):
@@ -71,14 +70,18 @@ class GigaChatAuth(httpx.Auth):
         yield request
 
 
-def get_llm(settings: PlatformSettings) -> Tuple[BaseChatModel, str]:
+def get_llm(settings: PlatformSettings, yaml_config=None) -> Tuple[BaseChatModel, str]:
     """
-    Initializes LLM instance based on environment configuration (DeepSeek or GigaChat).
+    Initializes LLM instance dynamically based on environment or config.yaml settings.
 
     Returns:
         Tuple[BaseChatModel, str]: LLM instance and provider description.
     """
-    provider = (os.getenv("LLM_PROVIDER") or getattr(settings, "llm_provider", "deepseek")).lower()
+    provider = (
+        os.getenv("LLM_PROVIDER")
+        or (getattr(yaml_config, "llm_provider", "") if yaml_config else "")
+        or getattr(settings, "llm_provider", "gigachat")
+    ).lower().strip()
     gigachat_creds = (os.getenv("GIGACHAT_CREDENTIALS") or getattr(settings, "gigachat_credentials", "") or "").strip()
     deepseek_key = (os.getenv("DEEPSEEK_API_KEY") or getattr(settings, "deepseek_api_key", "") or "").strip()
 
@@ -88,9 +91,12 @@ def get_llm(settings: PlatformSettings) -> Tuple[BaseChatModel, str]:
         gigachat_base_url = (os.getenv("GIGACHAT_BASE_URL") or getattr(settings, "gigachat_base_url", "https://api.giga.chat/v1") or "https://api.giga.chat/v1").strip()
         scope = (os.getenv("GIGACHAT_SCOPE") or "GIGACHAT_API_PERS").strip()
         verify_ssl = getattr(settings, "gigachat_verify_ssl_certs", False)
+        gigachat_auth_url = getattr(settings, "gigachat_auth_url", "https://ngw.devices.sberbank.ru:9443/api/v2/oauth")
+        llm_timeout = getattr(settings, "llm_timeout", 45.0)
+        llm_temp = getattr(settings, "llm_temperature", 0.0)
 
         try:
-            auth_handler = GigaChatAuth(gigachat_creds, scope=scope, verify_ssl=verify_ssl)
+            auth_handler = GigaChatAuth(gigachat_creds, scope=scope, verify_ssl=verify_ssl, auth_url=gigachat_auth_url)
             initial_token = auth_handler.get_token()
 
             http_client = httpx.Client(verify=verify_ssl, auth=auth_handler)
@@ -100,9 +106,9 @@ def get_llm(settings: PlatformSettings) -> Tuple[BaseChatModel, str]:
                 base_url=gigachat_base_url,
                 api_key=initial_token,
                 model=gigachat_model,
-                temperature=0.0,
-                request_timeout=45.0,
-                timeout=45.0,
+                temperature=llm_temp,
+                request_timeout=llm_timeout,
+                timeout=llm_timeout,
                 max_retries=1,
                 http_client=http_client,
                 http_async_client=http_async_client
@@ -118,14 +124,16 @@ def get_llm(settings: PlatformSettings) -> Tuple[BaseChatModel, str]:
     if not deepseek_base_url.endswith("/v1") and not deepseek_base_url.endswith("/v1/"):
         deepseek_base_url = f"{deepseek_base_url.rstrip('/')}/v1"
     deepseek_model = (os.getenv("DEEPSEEK_MODEL") or getattr(settings, "deepseek_model", "deepseek-v4-flash") or "deepseek-v4-flash").strip()
+    llm_timeout = getattr(settings, "llm_timeout", 45.0)
+    llm_temp = getattr(settings, "llm_temperature", 0.0)
 
     llm = ChatOpenAI(
         base_url=deepseek_base_url,
         api_key=deepseek_key,
         model=deepseek_model,
-        temperature=0.0,
-        request_timeout=45.0,
-        timeout=45.0,
+        temperature=llm_temp,
+        request_timeout=llm_timeout,
+        timeout=llm_timeout,
         max_retries=1
     )
     logger.info(f"Connected to DeepSeek API ({deepseek_base_url}) with model {deepseek_model}")

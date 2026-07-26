@@ -1,6 +1,5 @@
 """
 Shared Pydantic models for messaging payload and validation schemas.
-Strictly PEP 8 compliant.
 """
 
 from typing import List, Optional, Any
@@ -100,6 +99,7 @@ class TaskEvent(BaseModel):
     General event schema carried across message queues.
     """
     task_id: str
+    trace_id: Optional[str] = None
     raw_text: str
     parsed_data: Optional[ParseTaskResponse] = None
     rag_context: Optional[str] = None

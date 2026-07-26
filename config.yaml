@@ -1,5 +1,16 @@
 platform:
+  llm_provider: "gigachat"
   embedding_model: "intfloat/multilingual-e5-large"
+  retry_delay_seconds: 2
+  execution_timeout_seconds: 15
+  chroma_collection_name: "db_manuals"
+  rag_fallback_mapping:
+    pgbouncer_setup.md: ["bouncer", "pgbouncer", "пул", "pool"]
+    schema_migration.md: ["миграци", "схем", "concurrently", "индекс"]
+    backup_restore.md: ["бэкап", "резервн", "patroni", "dump"]
+    cert_update.md: ["ssl", "tls", "сертификат"]
+    compliance.md: ["аудит", "безопасн", "compliance"]
+    os_update.md: ["os", "пакет", "обновлени", "apt", "apk", "bouncer", "pgbouncer", "пул", "pool"]
   
 validation:
   allowed_objects:
@@ -49,6 +60,17 @@ pipeline:
       approval_queue: "q.tasks.execute_prod"
       enabled: true
 
+tracing:
+  # LLM Observability & трассировка всех вызовов LangChain/LangGraph
+  provider: "langfuse"
+  enabled: true
+  # Настройки для self-hosted Langfuse (переменные окружения):
+  #   LANGFUSE_SECRET_KEY  — секретный ключ проекта
+  #   LANGFUSE_PUBLIC_KEY  — публичный ключ проекта
+  #   LANGFUSE_BASE_URL    — URL Langfuse API (по умолчанию http://langfuse-web:3000)
+  # При отсутствии переменных tracing автоматически отключается,
+  # агенты продолжают работу в обычном режиме.
+
 agents:
   parser:
     prompt: |
@@ -78,6 +100,7 @@ agents:
     chunk_size: 1000
     chunk_overlap: 200
     initial_candidates: 5
+    reranker_enabled: true
     reranker_top_k: 2
     reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
     prompt: |

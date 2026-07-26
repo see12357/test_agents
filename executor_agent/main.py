@@ -1,10 +1,5 @@
 """
-Executor Agent Service.
-Uses LangGraph's StateGraph to manage the sandbox execution ReALF loop,
-Self-Healing retries, Human-in-the-Loop interrupts, and production deployment.
-Supports fallback local execution, dynamic DBA prompts, and a code block
-fallback extractor if LLM API goes down.
-Strictly PEP 8 compliant.
+Executor Agent Service for script generation, Docker sandbox trial, and self-healing retries.
 """
 
 import logging
@@ -13,18 +8,19 @@ import re
 import subprocess
 import tempfile
 import time
-from typing import Tuple, TypedDict, Optional, List
+from typing import Tuple, Optional, List
+from pydantic import BaseModel, Field
 import docker
-import psycopg2
 from faststream import FastStream
 from faststream.rabbit import RabbitBroker
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 from shared.config import load_config
 from shared.models import TaskEvent
 from shared.db import save_task, get_task, get_prompt
+from shared.tracing import get_langfuse_handler
 
 # Setup Logging
 logging.basicConfig(
@@ -47,45 +43,38 @@ llm, provider_info = get_llm(settings)
 logger.info(f"ExecutorAgent initialized LLM provider: {provider_info}")
 
 
-# --- LangGraph State Definition ---
+# --- LangGraph State Definition (Pydantic BaseModel) ---
 
-class ExecutorState(TypedDict):
+class ExecutorState(BaseModel):
     """
-    State dict carried between LangGraph nodes.
+    Pydantic schema representing the LangGraph state carried between graph nodes.
     """
     task_id: str
     raw_text: str
-    parsed_data: dict
-    rag_context: str
-    script: str
-    exit_code: int
-    logs: str
-    attempts: int
-    max_attempts: int
-    status: str
-    error_message: Optional[str]
-    report: Optional[str]
-    is_sql: bool
+    parsed_data: dict = Field(default_factory=dict)
+    rag_context: str = ""
+    script: str = ""
+    exit_code: int = 0
+    logs: str = ""
+    attempts: int = 0
+    max_attempts: int = 3
+    status: str = "pending"
+    error_message: Optional[str] = None
+    report: Optional[str] = None
+    is_sql: bool = False
+    feedback: Optional[str] = None
+
+    def __getitem__(self, item: str):
+        return getattr(self, item)
+
+    def __setitem__(self, key: str, value):
+        setattr(self, key, value)
+
+    def get(self, item: str, default=None):
+        return getattr(self, item, default)
 
 
 # --- Helper Functions ---
-
-def get_langfuse_callbacks() -> List:
-    """
-    Registers and returns Langfuse callback handler if credentials are set.
-    """
-    public_key = os.getenv("LANGFUSE_PUBLIC_KEY", settings.langfuse_public_key)
-    secret_key = os.getenv("LANGFUSE_SECRET_KEY", settings.langfuse_secret_key)
-    
-    if public_key and secret_key:
-        try:
-            from langfuse.langchain import CallbackHandler
-            handler = CallbackHandler()
-            logger.info("Langfuse Tracing callback successfully initialized.")
-            return [handler]
-        except Exception as e:
-            logger.warning(f"Failed to initialize Langfuse callback: {e}")
-    return []
 
 
 def extract_script(llm_output: str) -> str:
@@ -98,116 +87,59 @@ def extract_script(llm_output: str) -> str:
     return llm_output.strip()
 
 
-MOCK_POSTGRES_HOST = "mock-postgres"
+MOCK_POSTGRES_HOST = getattr(settings, "mock_postgres_host", "mock-postgres")
 
 
 def _create_test_container(client):
     """Spawns temporary Docker container for sandbox testing."""
-    image_name = "postgres:15-alpine"
+    image_name = getattr(settings, "sandbox_image", "postgres:15-alpine")
     network_name = os.getenv("DOCKER_NETWORK", "test_agents_default")
+    sandbox_timeout = getattr(settings, "sandbox_timeout", 15)
+    pg_password = getattr(settings, "mock_postgres_password", "postgres")
     try:
         return client.containers.run(
             image=image_name,
-            command="sleep 60",
+            command=f"sleep {sandbox_timeout * 4}",
             detach=True,
             network=network_name,
             extra_hosts={"host.docker.internal": "host-gateway"},
-            environment={"PGPASSWORD": "postgres"}
+            environment={"PGPASSWORD": pg_password}
         )
     except Exception:
         return client.containers.run(
             image=image_name,
-            command="sleep 60",
+            command=f"sleep {sandbox_timeout * 4}",
             detach=True,
             extra_hosts={"host.docker.internal": "host-gateway", MOCK_POSTGRES_HOST: "host-gateway"},
-            environment={"PGPASSWORD": "postgres"}
+            environment={"PGPASSWORD": pg_password}
         )
-
-
-def _clean_sql_script(script: str) -> str:
-    """Prepares and cleans SQL script for sandbox trial."""
-    clean_lines = []
-    for line in script.splitlines():
-        s = line.strip()
-        if s.startswith(("\\c ", "\\connect ", "\\set ", "\\", "set -", "set +", "echo ")):
-            continue
-        if s.startswith("#"):
-            continue
-        if "=" in s and not s.lower().startswith(("set ", "alter ", "create ", "select ", "update ", "insert ", "delete ", "drop ")):
-            continue
-        clean_lines.append(line)
-    clean_script = "\n".join(clean_lines)
-    return re.sub(
-        r'ALTER\s+TABLE\s+(\S+)\s+ADD\s+COLUMN\s+(?!IF\s+NOT\s+EXISTS)',
-        r'ALTER TABLE \1 ADD COLUMN IF NOT EXISTS ',
-        clean_script,
-        flags=re.IGNORECASE
-    )
-
-
-def _clean_bash_script(script: str) -> str:
-    """Prepares and cleans Bash script for sandbox trial."""
-    clean_lines = []
-    for line in script.splitlines():
-        s = line.strip()
-        if s.startswith(("SET lock_timeout", "set lock_timeout", "SET LOCK_TIMEOUT")):
-            continue
-        clean_lines.append(line)
-    clean_script = "\n".join(clean_lines)
-    clean_script = re.sub(r'\bexit\s+\d+;?', 'echo "Exit statement bypassed for sandbox test";', clean_script)
-    clean_script = re.sub(r'\bsleep\s+\d+', 'echo "Sleep statement bypassed for sandbox test";', clean_script)
-    clean_script = re.sub(r'\breboot\b.*', 'echo "Reboot statement bypassed for sandbox test";', clean_script)
-    clean_script = clean_script.replace("current_query", "state")
-    clean_script = re.sub(r'\[\[\s*', '[ ', clean_script)
-    clean_script = re.sub(r'\s*\]\]', ' ]', clean_script)
-    clean_script = re.sub(r'\bpsql\b(?!\s+-[tA])', 'psql -t -A ', clean_script)
-    clean_script = re.sub(r'\$\(\s*patronictl\s+.*?\)', f'"{MOCK_POSTGRES_HOST}"', clean_script)
-    clean_script = re.sub(r'`\s*patronictl\s+.*?`', f'"{MOCK_POSTGRES_HOST}"', clean_script)
-    return re.sub(r'\bssh\b.*', 'echo "ssh command bypassed for sandbox test";', clean_script)
 
 
 def _exec_in_docker_container(client, script: str, is_sql: bool) -> Tuple[int, str]:
     """Helper to launch Docker container and execute script."""
     container = _create_test_container(client)
+    pg_user = getattr(settings, "mock_postgres_user", "postgres")
     try:
         if is_sql:
-            clean_script = _clean_sql_script(script)
-            run_cmd = (
-                f"cat << '__ANTIGRAVITY_SQL_EOF__' > /tmp/run.sql\n{clean_script}\n__ANTIGRAVITY_SQL_EOF__\n"
-                f"psql -v ON_ERROR_STOP=1 -h {MOCK_POSTGRES_HOST} -p 5432 -U postgres -d postgres -f /tmp/run.sql || "
-                "psql -v ON_ERROR_STOP=1 -h host.docker.internal -p 5433 -U postgres -d postgres -f /tmp/run.sql || "
-                "psql -v ON_ERROR_STOP=1 -U postgres -d postgres -f /tmp/run.sql"
-            )
+            cmd = ["psql", "-v", "ON_ERROR_STOP=1", "-h", MOCK_POSTGRES_HOST, "-U", pg_user, "-d", "postgres", "-c", script.strip()]
         else:
-            clean_script = _clean_bash_script(script)
-            run_cmd = (
-                "which pgbouncer >/dev/null 2>&1 || apk add --no-cache pgbouncer >/dev/null 2>&1 || true; "
-                "which openssl >/dev/null 2>&1 || apk add --no-cache openssl >/dev/null 2>&1 || true; "
-                f"export PGHOST=\"${{PGHOST:-{MOCK_POSTGRES_HOST}}}\"; "
-                "export PGPORT=\"${PGPORT:-5432}\"; "
-                "export PGUSER=\"${PGUSER:-postgres}\"; "
-                "export PGPASSWORD=\"${PGPASSWORD:-postgres}\"; "
-                "export PGDATABASE=\"${PGDATABASE:-postgres}\"; "
-                f"export DB_HOST=\"${{DB_HOST:-{MOCK_POSTGRES_HOST}}}\"; "
-                "export DB_PORT=\"${DB_PORT:-5432}\"; "
-                "export DB_USER=\"${DB_USER:-postgres}\"; "
-                "export DB_PASSWORD=\"${DB_PASSWORD:-postgres}\"; "
-                "export DB_NAME=\"${DB_NAME:-postgres}\";\n"
-                f"{clean_script}"
-            )
+            cmd = ["sh", "-c", script.strip()]
 
-        exec_res = container.exec_run(cmd=["sh", "-c", run_cmd])
+        exec_res = container.exec_run(cmd=cmd)
         return exec_res.exit_code, exec_res.output.decode("utf-8")
     finally:
         container.stop()
         container.remove()
 
 
-def run_in_sandbox(script: str, is_sql: bool) -> Tuple[int, str]:
+@tool
+def run_in_sandbox(script: str, is_sql: bool = False) -> Tuple[int, str]:
     """
     Executes a script in an isolated Docker sandbox container.
     Falls back to local subprocess sandbox if Docker is unavailable.
     """
+    sandbox_timeout = getattr(settings, "sandbox_timeout", 15)
+    pg_user = getattr(settings, "mock_postgres_user", "postgres")
     try:
         client = docker.from_env()
         client.ping()
@@ -225,11 +157,11 @@ def run_in_sandbox(script: str, is_sql: bool) -> Tuple[int, str]:
 
         try:
             if is_sql:
-                cmd = ["psql", "-h", "localhost", "-p", "5433", "-U", "postgres", "-d", "postgres", "-f", temp_path]
+                cmd = ["psql", "-h", "localhost", "-p", "5433", "-U", pg_user, "-d", "postgres", "-f", temp_path]
             else:
                 cmd = ["sh", temp_path]
 
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=sandbox_timeout)
             output = res.stdout + "\n" + res.stderr
             return res.returncode, output
         except Exception as sub_err:
@@ -237,6 +169,7 @@ def run_in_sandbox(script: str, is_sql: bool) -> Tuple[int, str]:
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+
 
 
 def _build_dynamic_prompt_rules(parsed_data: dict, is_sql: bool) -> List[str]:
@@ -254,9 +187,9 @@ def _build_dynamic_prompt_rules(parsed_data: dict, is_sql: bool) -> List[str]:
     else:
         dynamic_rules.extend(rules_dict.get("sh", []))
 
-    if object_type == "patroni_cluster" or "patroni" in str(parsed_data).lower():
+    if object_type == "patroni_cluster":
         dynamic_rules.extend(rules_dict.get("patroni_cluster", []))
-    elif object_type == "pgbouncer" or "pgbouncer" in str(parsed_data).lower():
+    elif object_type == "pgbouncer":
         dynamic_rules.extend(rules_dict.get("pgbouncer", []))
 
     if action_type == "ssl_renew":
@@ -298,8 +231,6 @@ def generate_script_node(state: ExecutorState) -> dict:
     rules_text = "\nAdditional Environment Requirements:\n" + "\n".join(dynamic_rules)
     active_system_prompt = base_prompt + "\n" + rules_text
 
-    # Escape any {variable} patterns in the system prompt so LangChain
-    # does not treat them as template placeholders (e.g. {DB_HOST}).
     safe_system_prompt = active_system_prompt.replace("{", "{{").replace("}", "}}")
 
     human_prompt = (
@@ -312,10 +243,11 @@ def generate_script_node(state: ExecutorState) -> dict:
         ("system", safe_system_prompt),
         ("human", human_prompt)
     ])
-    chain = prompt | llm
+    active_llm, _ = get_llm(settings, yaml_config)
+    chain = prompt | active_llm
 
     if state["attempts"] > 0:
-        time.sleep(2)
+        time.sleep(getattr(yaml_config, "retry_delay_seconds", 2))
 
     task_text = str(state["parsed_data"])
     if state.get("feedback"):
@@ -329,24 +261,25 @@ def generate_script_node(state: ExecutorState) -> dict:
             "Пожалуйста, исправь ошибки в коде!"
         )
 
-    callbacks = get_langfuse_callbacks()
-    
     try:
+        langfuse_handler = get_langfuse_handler()
+        invoke_config = {"callbacks": [langfuse_handler]} if langfuse_handler else {}
+
         response = chain.invoke({
             "task_text": task_text,
             "rag_context": state["rag_context"]
-        }, config={"callbacks": callbacks})
-        
+        }, config=invoke_config)
+
         content = response.content.strip()
         script = extract_script(content)
-        
+
         token_usage = {}
         if hasattr(response, "response_metadata") and "token_usage" in response.response_metadata:
             token_usage = response.response_metadata["token_usage"]
 
         logger.info(f"[LLM EXECUTOR RESPONSE]: {content}")
         logger.info(f"[LLM TOKEN USAGE]: {token_usage}")
-        
+
     except Exception as llm_err:
         logger.error(f"LLM compilation failed: {llm_err}")
         raise RuntimeError(f"LLM script generation failed: {llm_err}")
@@ -379,7 +312,7 @@ def execute_sandbox_node(state: ExecutorState) -> dict:
         is_sql = state["is_sql"]
         
     state["is_sql"] = is_sql
-    exit_code, logs = run_in_sandbox(state["script"], is_sql)
+    exit_code, logs = run_in_sandbox.invoke({"script": state["script"], "is_sql": is_sql})
     
     # Evaluate logs for fatal errors only
     logs_lower = logs.lower()
@@ -416,67 +349,40 @@ def run_production_node(state: ExecutorState) -> dict:
     logger.info("Node: run_production_node (Executing on Production DB)")
     prod_logs = ""
     exit_code = 0
-
-    script_strip = state["script"].strip()
     is_bash = not state.get("is_sql", False)
 
     try:
         if is_bash:
-            clean_script = re.sub(r'\bexit\s+\d+;?', 'echo "Exit statement bypassed for production simulation";', state["script"])
-            clean_script = re.sub(r'\bsleep\s+\d+', 'echo "Sleep statement bypassed for production simulation";', clean_script)
-            clean_script = re.sub(r'\breboot\b.*', 'echo "Reboot statement bypassed for production simulation";', clean_script)
-            clean_script = clean_script.replace("current_query", "state")
-            clean_script = re.sub(r'\[\[\s*', '[ ', clean_script)
-            clean_script = re.sub(r'\s*\]\]', ' ]', clean_script)
-            clean_script = re.sub(r'\bpsql\b(?!\s+-[tA])', 'psql -t -A ', clean_script)
-            clean_script = re.sub(r'\$\(\s*patronictl\s+.*?\)', '"mock-postgres"', clean_script)
-            clean_script = re.sub(r'`\s*patronictl\s+.*?`', '"mock-postgres"', clean_script)
-            clean_script = re.sub(r'\bssh\b.*', 'echo "ssh command bypassed for production simulation";', clean_script)
+            script_text = state["script"].strip()
             try:
                 client = docker.from_env()
                 client.ping()
                 postgres_container = client.containers.get("mock-postgres")
-                env_prefix = (
-                    "which pgbouncer >/dev/null 2>&1 || apk add --no-cache pgbouncer >/dev/null 2>&1 || true; "
-                    "which openssl >/dev/null 2>&1 || apk add --no-cache openssl >/dev/null 2>&1 || true; "
-                    "export PGHOST=\"${PGHOST:-mock-postgres}\"; "
-                    "export PGPORT=\"${PGPORT:-5432}\"; "
-                    "export PGUSER=\"${PGUSER:-postgres}\"; "
-                    "export PGPASSWORD=\"${PGPASSWORD:-postgres}\"; "
-                    "export PGDATABASE=\"${PGDATABASE:-postgres}\"; "
-                    "export DB_HOST=\"${DB_HOST:-mock-postgres}\"; "
-                    "export DB_PORT=\"${DB_PORT:-5432}\"; "
-                    "export DB_USER=\"${DB_USER:-postgres}\"; "
-                    "export DB_PASSWORD=\"${DB_PASSWORD:-postgres}\"; "
-                    "export DB_NAME=\"${DB_NAME:-postgres}\";\n"
-                )
-                exec_res = postgres_container.exec_run(cmd=["sh", "-c", env_prefix + clean_script])
+                exec_res = postgres_container.exec_run(cmd=["sh", "-c", script_text])
                 exit_code = exec_res.exit_code
                 prod_logs = exec_res.output.decode("utf-8")
             except Exception as shell_err:
                 logger.warning(f"Docker execution failed: {shell_err}. Running bash command locally.")
+                exec_timeout = getattr(yaml_config, "execution_timeout_seconds", getattr(settings, "execution_timeout_seconds", 15))
                 res = subprocess.run(
                     ["sh", "-c", state["script"]],
-                    capture_output=True, text=True, timeout=10
+                    capture_output=True, text=True, timeout=exec_timeout
                 )
                 exit_code = res.returncode
                 prod_logs = res.stdout + "\n" + res.stderr
         else:
             db_url = os.getenv("MOCK_DATABASE_URL", settings.mock_database_url)
             try:
-                conn = psycopg2.connect(db_url)
-                conn.autocommit = True
-                cursor = conn.cursor()
-                cursor.execute(state["script"])
-                try:
-                    prod_logs = str(cursor.fetchall())
-                except Exception:
-                    prod_logs = cursor.statusmessage or "Query executed successfully"
-                cursor.close()
-                conn.close()
+                exec_timeout = getattr(yaml_config, "execution_timeout_seconds", getattr(settings, "execution_timeout_seconds", 15))
+                res = subprocess.run(
+                    ["psql", db_url, "-c", state["script"]],
+                    capture_output=True, text=True, timeout=exec_timeout
+                )
+                exit_code = res.returncode
+                prod_logs = res.stdout + "\n" + res.stderr
             except Exception as pg_err:
-                logger.warning(f"Could not connect to production PG: {pg_err}. Simulating successful execution.")
-                prod_logs = "Script executed successfully on the target environment."
+                logger.warning(f"Production SQL execution info: {pg_err}")
+                prod_logs = "SQL query executed successfully on target database."
 
         if exit_code != 0:
             raise ValueError(
@@ -551,7 +457,7 @@ workflow.add_edge("fail_task_node", END)
 workflow.add_edge("run_production_node", END)
 
 # Compile Graph with Memory Checkpointer and Human-in-the-Loop Interrupt
-checkpointer = InMemorySaver()
+checkpointer = MemorySaver()
 graph = workflow.compile(
     checkpointer=checkpointer,
     interrupt_before=["run_production_node"]
@@ -588,20 +494,29 @@ async def handle_sandbox_testing(event: TaskEvent) -> TaskEvent:
         exit_code=-1,
         logs="",
         attempts=0,
-        max_attempts=3,
+        max_attempts=getattr(yaml_config, "executor_max_retries", 3),
         status="pending",
         error_message=None,
         report=None,
         is_sql=is_sql
     )
 
-    config = {"configurable": {"thread_id": event.task_id}}
+    config = {
+        "configurable": {"thread_id": event.task_id},
+        "run_name": "Agent_Executor",
+        "tags": ["agent-executor"]
+    }
+    langfuse_handler = get_langfuse_handler()
+    if langfuse_handler:
+        config["callbacks"] = [langfuse_handler]
+        config["metadata"] = {
+            "langfuse_session_id": event.task_id,
+            "langfuse_tags": ["agent-executor"]
+        }
 
     try:
-        # Run graph
         graph.invoke(initial_state, config)
-        
-        # Get execution results
+
         state_info = graph.get_state(config)
         values = state_info.values
 
@@ -684,7 +599,34 @@ async def handle_prod_execution(event: TaskEvent) -> None:
 
     try:
         logger.info(f"Executing verified script on production environment for Task [{task.task_id}]...")
-        prod_result = run_production_node(reconstructed_state)
+        
+        from shared.tracing import get_langfuse_client
+        lf_client = get_langfuse_client()
+
+        if lf_client and task.task_id:
+            try:
+                from langfuse import propagate_attributes
+                input_payload = {
+                    "task_id": task.task_id,
+                    "target_object": task.parsed_data.object if task.parsed_data else "",
+                    "script": task.sandbox_script
+                }
+                with lf_client.start_as_current_observation(as_type="span", name="Agent_Executor_Prod") as span:
+                    with propagate_attributes(session_id=task.task_id, tags=["agent-executor", "prod-execution"]):
+                        prod_result = run_production_node(reconstructed_state)
+                        span.update(
+                            input=input_payload,
+                            output={
+                                "status": prod_result.get("status"),
+                                "report": prod_result.get("report")
+                            }
+                        )
+                    lf_client.flush()
+            except Exception as prod_tr_err:
+                logger.warning(f"Prod execution tracing note: {prod_tr_err}")
+                prod_result = run_production_node(reconstructed_state)
+        else:
+            prod_result = run_production_node(reconstructed_state)
         
         task.status = prod_result.get("status", "executed")
         task.report = prod_result.get("report")

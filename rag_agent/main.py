@@ -1,18 +1,14 @@
 """
-RAG Agent Service.
-Subscribes to q.tasks.parsed, retrieves relevant documentation from ChromaDB.
-Falls back to local file keyword search if ChromaDB is unavailable.
-Strictly PEP 8 compliant.
+RAG Agent Service for document retrieval and context enrichment.
 """
 
 import logging
 import os
 from typing import Optional
-import chromadb
 from faststream import FastStream
 from faststream.rabbit import RabbitBroker
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
+from langchain_core.tools import tool
 from shared.config import load_config
 from shared.models import TaskEvent
 from shared.db import save_task, get_prompt
@@ -24,6 +20,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RagasAgent")
 
+# Initialize tracing (no-op if LANGFUSE_* env vars are missing)
+
 # Load Configuration
 settings, yaml_config = load_config()
 
@@ -32,29 +30,24 @@ rabbitmq_url = os.getenv("RABBITMQ_URL", settings.rabbitmq_url)
 broker = RabbitBroker(rabbitmq_url)
 app = FastStream(broker)
 
-# Setup Chroma client and embeddings
-chroma_host = os.getenv("CHROMA_HOST", settings.chroma_host)
-chroma_port = int(os.getenv("CHROMA_PORT", str(settings.chroma_port)))
+from shared.chroma_util import get_chroma_client_and_embeddings
 
-logger.info(f"ChromaDB target: {chroma_host}:{chroma_port}")
-logger.info(f"Initializing embedding model: {yaml_config.embedding_model}")
+# Setup Chroma client and embeddings
+collection_name = yaml_config.chroma_collection_name
+logger.info(f"Initializing ChromaDB connection (collection='{collection_name}', model='{yaml_config.embedding_model}')")
 
 try:
-    embeddings = HuggingFaceEmbeddings(
-        model_name=yaml_config.embedding_model,
-        encode_kwargs={"normalize_embeddings": True}
-    )
-    chroma_client = chromadb.HttpClient(host=chroma_host, port=chroma_port)
+    chroma_client, embeddings = get_chroma_client_and_embeddings(settings, yaml_config)
     db = Chroma(
         client=chroma_client,
-        collection_name="db_manuals",
+        collection_name=collection_name,
         embedding_function=embeddings
     )
     try:
-        coll = chroma_client.get_collection("db_manuals")
+        coll = chroma_client.get_collection(collection_name)
         if coll.count() == 0:
-            logger.info("ChromaDB collection 'db_manuals' is empty. Auto-running seed_db...")
-            from seed_db import main as seed_main
+            logger.info(f"ChromaDB collection '{collection_name}' is empty. Auto-running chunker...")
+            from chunker import main as seed_main
             seed_main()
     except Exception as seed_err:
         logger.warning(f"Auto-seeding check note: {seed_err}")
@@ -63,29 +56,22 @@ except Exception as e:
     db = None
 
 # Initialize CrossEncoder Re-ranker
-try:
-    from sentence_transformers import CrossEncoder
-    reranker = CrossEncoder(yaml_config.rag_reranker_model)
-    logger.info(f"Initialized CrossEncoder reranker ({yaml_config.rag_reranker_model})")
-except Exception as re_err:
-    logger.warning(f"Could not initialize CrossEncoder reranker: {re_err}")
-    reranker = None
+reranker = None
+if getattr(yaml_config, "rag_reranker_enabled", True):
+    try:
+        from sentence_transformers import CrossEncoder
+        reranker = CrossEncoder(yaml_config.rag_reranker_model)
+        logger.info(f"Initialized CrossEncoder reranker ({yaml_config.rag_reranker_model})")
+    except Exception as re_err:
+        logger.warning(f"Could not initialize CrossEncoder reranker: {re_err}")
 
 
 def _match_fallback_filename(query_lower: str) -> Optional[str]:
-    """Maps search query keywords to deterministic DBA manual filename."""
-    if any(k in query_lower for k in ["bouncer", "pgbouncer", "пул", "pool"]):
-        return "pgbouncer_setup.md"
-    if any(k in query_lower for k in ["миграци", "схем", "concurrently", "индекс"]):
-        return "schema_migration.md"
-    if any(k in query_lower for k in ["бэкап", "резервн", "patroni", "dump"]):
-        return "backup_restore.md"
-    if any(k in query_lower for k in ["ssl", "tls", "сертификат"]):
-        return "cert_update.md"
-    if any(k in query_lower for k in ["аудит", "безопасн", "compliance"]):
-        return "compliance.md"
-    if any(k in query_lower for k in ["os", "пакет", "обновлени"]):
-        return "os_update.md"
+    """Maps search query keywords to deterministic DBA manual filename using config.yaml."""
+    mapping = yaml_config.rag_fallback_mapping or {}
+    for filename, keywords in mapping.items():
+        if any(k in query_lower for k in keywords):
+            return filename
     return None
 
 
@@ -176,6 +162,15 @@ def _retrieve_chromadb_context(search_query: str) -> str:
     return "\n\n".join(manuals)
 
 
+@tool
+def retrieve_dba_manuals_tool(query: str) -> str:
+    """
+    LangChain Tool: Retrieves relevant DBA operational guidelines, checklists, and manuals from vector store or fallback docs.
+    Returns concatenated markdown manuals.
+    """
+    return _retrieve_chromadb_context(query)
+
+
 @broker.subscriber(SUBSCRIBE_QUEUE)
 @broker.publisher(PUBLISH_QUEUE)
 async def handle_rag_enrichment(event: TaskEvent) -> TaskEvent:
@@ -207,8 +202,32 @@ async def handle_rag_enrichment(event: TaskEvent) -> TaskEvent:
     search_query = " ".join(query_parts)
     logger.info(f"Constructed RAG search query: '{search_query}'")
 
+    from shared.tracing import get_langfuse_client
+    lf_client = get_langfuse_client()
+
     try:
-        event.rag_context = _retrieve_chromadb_context(search_query)
+        if lf_client and event.task_id:
+            try:
+                from langfuse import propagate_attributes
+                input_payload = {
+                    "raw_text": event.raw_text,
+                    "subtask_actions": [sub.action for sub in event.parsed_data.subtasks],
+                    "compiled_vector_query": search_query
+                }
+                with lf_client.start_as_current_observation(as_type="span", name="Agent_RAG") as span:
+                    with propagate_attributes(session_id=event.task_id, tags=["agent-rag"]):
+                        event.rag_context = _retrieve_chromadb_context(search_query)
+                        span.update(
+                            input=input_payload,
+                            output={"retrieved_documentation": event.rag_context or ""}
+                        )
+                    lf_client.flush()
+            except Exception as rag_tr_err:
+                logger.warning(f"RAG tracing note: {rag_tr_err}")
+                event.rag_context = _retrieve_chromadb_context(search_query)
+        else:
+            event.rag_context = _retrieve_chromadb_context(search_query)
+
         event.status = "enriched"
         logger.info(f"[RAG SUCCESS] Task [{event.task_id}] enriched with documentation!")
     except Exception as err:

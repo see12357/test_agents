@@ -1,8 +1,5 @@
 """
 FastAPI Gateway and Orchestrator Service.
-Exposes REST API endpoints to submit tasks, check state, approve tasks,
-manage dynamic DBA prompts, and check system health.
-Strictly PEP 8 compliant.
 """
 
 import logging
@@ -101,6 +98,7 @@ async def submit_task(request: TaskSubmitRequest):
     
     event = TaskEvent(
         task_id=task_id,
+        trace_id=task_id,
         raw_text=request.text,
         status="pending"
     )
@@ -109,6 +107,23 @@ async def submit_task(request: TaskSubmitRequest):
     raw_queue = parser_step.subscribe_queue if parser_step else "q.tasks.raw"
 
     save_task(event)
+
+    from shared.tracing import get_langfuse_client
+    langfuse_client = get_langfuse_client()
+    if langfuse_client:
+        try:
+            clean_id = task_id.replace("-", "").lower()[:32]
+            langfuse_client.trace(
+                id=clean_id,
+                name=f"DBA_Pipeline_{task_id[:8]}",
+                session_id=task_id,
+                input={"raw_text": request.text},
+                tags=["dba-pipeline"]
+            )
+            langfuse_client.flush()
+        except Exception as trace_err:
+            logger.warning(f"Could not init Langfuse trace: {trace_err}")
+
     await broker.publish(event, queue=raw_queue)
     logger.info(f"Published task [{task_id}] to {raw_queue}")
     
@@ -163,8 +178,10 @@ async def approve_task(task_id: str):
     task.status = "approved"
     save_task(task)
     
-    await broker.publish(task, queue="q.tasks.execute_prod")
-    logger.info(f"Published task [{task_id}] to q.tasks.execute_prod")
+    executor_step = yaml_config.get_pipeline_step("executor")
+    prod_queue = executor_step.approval_queue if (executor_step and executor_step.approval_queue) else "q.tasks.execute_prod"
+    await broker.publish(task, queue=prod_queue)
+    logger.info(f"Published task [{task_id}] to {prod_queue}")
     
     return {
         "task_id": task_id,
@@ -223,12 +240,15 @@ async def provide_task_feedback(task_id: str, request: TaskFeedbackRequest):
             detail=f"Task with ID '{task_id}' not found"
         )
         
+    executor_step = yaml_config.get_pipeline_step("executor")
+    ready_queue = executor_step.subscribe_queue if executor_step else "q.tasks.ready_for_execution"
+
     if request.edited_script:
         logger.info(f"Human-in-the-loop: task [{task_id}] updated with manual script edit")
         task.sandbox_script = request.edited_script
         task.status = "enriched"
         save_task(task)
-        await broker.publish(task, queue="q.tasks.ready_for_execution")
+        await broker.publish(task, queue=ready_queue)
         return {
             "task_id": task_id,
             "status": "retesting_edited_script"
@@ -239,7 +259,7 @@ async def provide_task_feedback(task_id: str, request: TaskFeedbackRequest):
         task.feedback = request.feedback
         task.status = "enriched"
         save_task(task)
-        await broker.publish(task, queue="q.tasks.ready_for_execution")
+        await broker.publish(task, queue=ready_queue)
         return {
             "task_id": task_id,
             "status": "regenerating_with_feedback"
@@ -251,6 +271,44 @@ async def provide_task_feedback(task_id: str, request: TaskFeedbackRequest):
     )
 
 
+class LLMProviderRequest(BaseModel):
+    provider: str = Field(
+        ...,
+        description="Выбор провайдера LLM: 'gigachat' или 'deepseek'"
+    )
+
+
+@app.get(
+    "/config/llm",
+    summary="Get active LLM provider"
+)
+async def get_active_llm_provider():
+    """Returns the currently active LLM provider."""
+    provider = (os.getenv("LLM_PROVIDER") or getattr(yaml_config, "llm_provider", "gigachat")).lower()
+    return {"active_provider": provider}
+
+
+@app.post(
+    "/config/llm",
+    summary="Hot-switch LLM provider on-the-fly without container restart"
+)
+async def set_active_llm_provider(request: LLMProviderRequest):
+    """Dynamically hot-switches active LLM provider for all incoming tasks."""
+    prov = request.provider.lower().strip()
+    if prov not in ("gigachat", "deepseek"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provider must be 'gigachat' or 'deepseek'"
+        )
+    os.environ["LLM_PROVIDER"] = prov
+    yaml_config.llm_provider = prov
+    logger.info(f"Hot-switched active LLM provider to: '{prov}'")
+    return {
+        "status": "success",
+        "active_provider": prov
+    }
+
+
 @app.get(
     "/prompt/{agent_name}",
     summary="Get the current system prompt for a specific agent"
@@ -259,17 +317,22 @@ async def get_agent_prompt(agent_name: str):
     """
     Returns the dynamic system prompt of a registered agent.
     """
-    if agent_name not in ("parser", "executor"):
+    allowed_agent_names = [step.name for step in yaml_config.pipeline_steps] if yaml_config.pipeline_steps else ["parser", "rag", "executor"]
+    if agent_name not in allowed_agent_names:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid agent name. Must be 'parser' or 'executor'."
+            detail=f"Invalid agent name '{agent_name}'. Allowed agents defined in pipeline config: {allowed_agent_names}"
         )
     
-    default_val = (
-        yaml_config.parser_prompt
-        if agent_name == "parser"
-        else yaml_config.executor_prompt
-    )
+    if agent_name == "parser":
+        default_val = yaml_config.parser_prompt
+    elif agent_name == "rag":
+        default_val = yaml_config.rag_prompt
+    elif agent_name == "executor":
+        default_val = yaml_config.executor_prompt
+    else:
+        default_val = getattr(yaml_config, f"{agent_name}_prompt", "")
+
     current_prompt = get_prompt(agent_name, default_val)
     return {
         "agent_name": agent_name,
@@ -285,10 +348,11 @@ async def update_agent_prompt(agent_name: str, request: PromptUpdateRequest):
     """
     Dynamically overwrites system prompt for an agent in SQLite.
     """
-    if agent_name not in ("parser", "executor"):
+    allowed_agent_names = [step.name for step in yaml_config.pipeline_steps] if yaml_config.pipeline_steps else ["parser", "rag", "executor"]
+    if agent_name not in allowed_agent_names:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid agent name. Must be 'parser' or 'executor'."
+            detail=f"Invalid agent name '{agent_name}'. Allowed agents defined in pipeline config: {allowed_agent_names}"
         )
         
     logger.info(f"Updating system prompt for agent [{agent_name}] dynamically...")
@@ -316,7 +380,8 @@ async def health_check():
     
     # 1. Database Check
     try:
-        get_task("health-check-id")
+        health_id = getattr(settings, "health_check_task_id", "health-check-system-id")
+        get_task(health_id)
         health_status["database"] = "healthy"
     except Exception as e:
         logger.error(f"Health check Database failure: {e}")

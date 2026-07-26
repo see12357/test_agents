@@ -1,37 +1,23 @@
 """
-Standalone Document Chunking Module for DB Maintenance Manuals.
-Uses Markdown-aware RecursiveCharacterTextSplitter with rich metadata enrichment.
-Strictly PEP 8 compliant.
+Document chunking and ChromaDB vector store seeding CLI.
 """
 
 import os
 import argparse
 from typing import List, Optional
-from langchain_core.documents import Document
+from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-
+from langchain_core.documents import Document
 from shared.config import load_config
-
-_, _yaml_cfg = load_config()
+from shared.chroma_util import get_chroma_client_and_embeddings
 
 
 def load_and_chunk_documents(
     docs_dir: str = "documents",
-    chunk_size: Optional[int] = None,
-    chunk_overlap: Optional[int] = None
+    chunk_size: Optional[int] = 1000,
+    chunk_overlap: Optional[int] = 200
 ) -> List[Document]:
-    """
-    Reads all Markdown documents from `docs_dir` and splits them into chunks.
-
-    Args:
-        docs_dir (str): Directory containing Markdown manuals.
-        chunk_size (int): Maximum characters per chunk.
-        chunk_overlap (int): Overlap character count between chunks.
-
-    Returns:
-        List[Document]: List of chunked Document objects.
-    """
+    """Reads Markdown documents from docs_dir and splits them into chunks."""
     if not os.path.isabs(docs_dir):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         docs_dir = os.path.join(base_dir, docs_dir)
@@ -46,13 +32,12 @@ def load_and_chunk_documents(
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            topic = filename.replace(".md", "")
             raw_documents.append(
                 Document(
                     page_content=content,
                     metadata={
                         "source": filename,
-                        "topic": topic,
+                        "topic": filename.replace(".md", ""),
                         "file_path": filepath
                     }
                 )
@@ -61,7 +46,6 @@ def load_and_chunk_documents(
     if not raw_documents:
         return []
 
-    # Markdown-aware splitting
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -69,7 +53,6 @@ def load_and_chunk_documents(
     )
     chunked_docs = splitter.split_documents(raw_documents)
 
-    # Attach chunk indexing metadata
     for i, doc in enumerate(chunked_docs):
         doc.metadata["chunk_id"] = i + 1
         doc.metadata["total_chunks"] = len(chunked_docs)
@@ -77,20 +60,54 @@ def load_and_chunk_documents(
     return chunked_docs
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Standalone Document Chunker CLI")
-    parser.add_argument("--dir", default="documents", help="Path to documents folder")
-    parser.add_argument("--size", type=int, default=1000, help="Chunk size")
-    parser.add_argument("--overlap", type=int, default=200, help="Chunk overlap")
-    args = parser.parse_args()
+def seed_database(preview_only: bool = False) -> None:
+    """Chunks documents and indexes them in ChromaDB vector store."""
+    settings, yaml_config = load_config()
+    docs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "documents")
 
-    chunks = load_and_chunk_documents(docs_dir=args.dir, chunk_size=args.size, chunk_overlap=args.overlap)
-    print(f"=== Chunker Results ===")
-    print(f"Source Directory: {args.dir}")
-    print(f"Total Chunks Generated: {len(chunks)}")
-    for i, chunk in enumerate(chunks[:3]):
-        print(f"\n--- Chunk {i+1} [{chunk.metadata['source']}] ---")
-        print(f"Content:\n{chunk.page_content[:150]}...")
+    chunk_size = yaml_config.chunk_size or 1000
+    chunk_overlap = yaml_config.chunk_overlap or 200
+
+    print(f"Loading and chunking documents (size={chunk_size}, overlap={chunk_overlap})...")
+    documents = load_and_chunk_documents(docs_dir=docs_dir, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    
+    if not documents:
+        print("No documents found.")
+        return
+
+    print(f"Total chunks generated: {len(documents)}")
+    if preview_only:
+        for i, chunk in enumerate(documents[:3]):
+            print(f"\n--- Chunk {i+1} [{chunk.metadata['source']}] ---")
+            print(f"{chunk.page_content[:150]}...")
+        return
+
+    try:
+        client, embeddings = get_chroma_client_and_embeddings(settings, yaml_config)
+    except Exception as e:
+        print(f"Failed to initialize ChromaDB embeddings client: {e}")
+        return
+
+    collection_name = yaml_config.chroma_collection_name
+    print(f"Indexing {len(documents)} chunks in collection '{collection_name}' with model: {yaml_config.embedding_model}")
+
+    try:
+        Chroma.from_documents(
+            documents=documents,
+            embedding=embeddings,
+            collection_name=collection_name,
+            client=client
+        )
+        print(f"ChromaDB collection '{collection_name}' successfully seeded!")
+    except Exception as e:
+        print(f"Error seeding ChromaDB: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Document Chunker & ChromaDB Seeding CLI")
+    parser.add_argument("--preview", action="store_true", help="Preview chunks without seeding ChromaDB")
+    args = parser.parse_args()
+    seed_database(preview_only=args.preview)
 
 
 if __name__ == "__main__":

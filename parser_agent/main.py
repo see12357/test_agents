@@ -1,23 +1,21 @@
 """
-Parser Agent Service.
-Subscribes to q.tasks.raw, parses raw text using OpenAI-compatible ChatOpenAI,
-validates against configuration guards, and publishes to q.tasks.parsed.
-Loads system prompts dynamically from SQLite database at runtime.
-Strictly PEP 8 compliant.
+Parser Agent Service for structured extraction and input validation.
 """
 
 import json
 import logging
 import os
 import re
-from typing import List, Tuple
+from typing import Tuple, Optional
 from faststream import FastStream
 from faststream.rabbit import RabbitBroker
-from langchain_openai import ChatOpenAI
+from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.tools import tool
 from shared.config import load_config
 from shared.models import TaskEvent, ParseTaskResponse
 from shared.db import save_task, init_db, get_prompt
+from shared.tracing import get_langfuse_handler
 
 # Setup Logging
 logging.basicConfig(
@@ -48,29 +46,11 @@ llm, provider_info = get_llm(settings)
 logger.info(f"ParserAgent initialized LLM provider: {provider_info}")
 
 
-def get_langfuse_callbacks() -> List:
-    """
-    Registers and returns Langfuse callback handler if credentials are set.
-    """
-    public_key = os.getenv("LANGFUSE_PUBLIC_KEY", settings.langfuse_public_key)
-    secret_key = os.getenv("LANGFUSE_SECRET_KEY", settings.langfuse_secret_key)
-    
-    if public_key and secret_key:
-        try:
-            from langfuse.langchain import CallbackHandler
-            handler = CallbackHandler()
-            logger.info("Langfuse Tracing callback successfully initialized.")
-            return [handler]
-        except Exception as e:
-            logger.warning(f"Failed to initialize Langfuse callback: {e}")
-    return []
-
-
 def _match_regex_object(text_lower: str) -> str:
     for obj in yaml_config.allowed_objects:
         if obj.lower() in text_lower:
             return obj
-    return "pg-billing-prod"
+    return yaml_config.allowed_objects[0] if (yaml_config.allowed_objects and len(yaml_config.allowed_objects) > 0) else "pg-billing-prod"
 
 
 def _match_regex_object_type(text_lower: str) -> str:
@@ -83,7 +63,9 @@ def _match_regex_object_type(text_lower: str) -> str:
         return "pgbouncer"
     if "redis" in text_lower:
         return "redis_sentinel"
-    return "postgres_standalone"
+    if any(k in text_lower for k in ["postgres", "постгрес", "субд", "баз", "pg"]):
+        return "postgres_standalone"
+    return yaml_config.allowed_object_types[0] if yaml_config.allowed_object_types else "postgres_standalone"
 
 
 def _match_regex_action(text_lower: str) -> str:
@@ -98,7 +80,9 @@ def _match_regex_action(text_lower: str) -> str:
         return "ssl_renew"
     if any(k in text_lower for k in ["аудит", "безопасн", "compliance", "прав"]):
         return "compliance_audit"
-    return "os_upgrade"
+    if any(k in text_lower for k in ["os", "пакет", "обновлени", "apt", "apk", "bouncer", "pgbouncer", "пул", "pool"]):
+        return "os_upgrade"
+    return "unknown_action"
 
 
 def _match_regex_priority(text_lower: str) -> str:
@@ -126,8 +110,9 @@ def parse_with_regex_fallback(raw_text: str) -> ParseTaskResponse:
         
     is_downtime = any(kw in text_lower for kw in ["downtime", "простой", "останов", "перезагруз", "reboot"])
     
+    default_sla = getattr(yaml_config, "default_sla_minutes", 60)
     sla_match = re.search(r"(\d+)\s*(минут|мин|min)", text_lower)
-    sla_minutes = int(sla_match.group(1)) if sla_match else 60
+    sla_minutes = int(sla_match.group(1)) if sla_match else default_sla
     
     from shared.models import Subtask
     subtasks = [
@@ -155,37 +140,76 @@ def parse_with_regex_fallback(raw_text: str) -> ParseTaskResponse:
     )
 
 
-def parse_with_llm(raw_text: str, callbacks: List) -> Tuple[ParseTaskResponse, dict]:
+def parse_with_llm(raw_text: str, trace_id: Optional[str] = None) -> Tuple[ParseTaskResponse, dict]:
     """
-    Calls OpenAI-compatible LLM to parse raw text into structured JSON.
-    Extracts token metrics and raw text.
+    Calls LLM using Pydantic structured output validation (ParseTaskResponse).
+    Guarantees schema validation against Pydantic model.
     """
     active_prompt = get_prompt("parser", yaml_config.parser_prompt)
-    active_prompt = active_prompt.replace("{", "{{").replace("}", "}}")
+    pydantic_parser = PydanticOutputParser(pydantic_object=ParseTaskResponse)
+    format_instructions = pydantic_parser.get_format_instructions().replace("{", "{{").replace("}", "}}")
+    escaped_prompt = active_prompt.replace("{", "{{").replace("}", "}}")
+    full_system_prompt = f"{escaped_prompt}\n\nSTRICT SCHEMA FORMAT INSTRUCTIONS:\n{format_instructions}"
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", active_prompt),
-        ("human", "Текст заявки: {text}\n\nВерни JSON по схеме.")
+        ("system", full_system_prompt),
+        ("human", "Request text: {text}")
     ])
 
-    chain = prompt | llm
-    response = chain.invoke({"text": raw_text}, config={"callbacks": callbacks})
-
-    content = response.content.strip()
-    logger.info(f"LLM response: {content}")
-    
-    token_usage = {}
-    if hasattr(response, "response_metadata") and "token_usage" in response.response_metadata:
-        token_usage = response.response_metadata["token_usage"]
-
-    llm_info = {
-        "prompt": active_prompt,
-        "raw_response": content,
-        "token_usage": token_usage
+    active_llm, _ = get_llm(settings, yaml_config)
+    langfuse_handler = get_langfuse_handler()
+    invoke_config = {
+        "run_name": "Agent_Parser",
+        "tags": ["agent-parser"]
     }
+    if langfuse_handler:
+        invoke_config["callbacks"] = [langfuse_handler]
+        if trace_id:
+            invoke_config["metadata"] = {
+                "langfuse_session_id": trace_id,
+                "langfuse_tags": ["agent-parser"]
+            }
 
-    parsed_json = json.loads(content)
-    return ParseTaskResponse(**parsed_json), llm_info
+    try:
+        chain = prompt | active_llm
+        response = chain.invoke({"text": raw_text}, config=invoke_config)
+        content = response.content.strip()
+
+        token_usage = {}
+        if hasattr(response, "response_metadata") and "token_usage" in response.response_metadata:
+            token_usage = response.response_metadata["token_usage"]
+
+        # Parse JSON and validate against Pydantic schema
+        if content.startswith("```"):
+            lines = content.splitlines()
+            content = "\n".join(lines[1:-1]) if len(lines) > 2 else content.replace("```json", "").replace("```", "")
+        
+        parsed_json = json.loads(content.strip())
+        parsed_model = ParseTaskResponse(**parsed_json)
+        llm_info = {
+            "prompt": active_prompt,
+            "raw_response": content,
+            "token_usage": token_usage
+        }
+        return parsed_model, llm_info
+    except Exception as err:
+        logger.warning(f"JSON parsing error: {err}. Running Regex Parser Fallback...")
+        parsed_model = parse_with_regex_fallback(raw_text)
+        return parsed_model, {
+            "prompt": active_prompt,
+            "raw_response": str(err),
+            "fallback": "regex"
+        }
+
+
+@tool
+def parse_task_intent_tool(raw_text: str) -> str:
+    """
+    LangChain Tool: Parses unstructured DBA request text into a validated Pydantic JSON structure.
+    Returns JSON string representation of ParseTaskResponse.
+    """
+    parsed_model, _ = parse_with_llm(raw_text)
+    return parsed_model.model_dump_json()
 
 
 def _assign_risk_level(parsed: ParseTaskResponse, raw_text: str) -> ParseTaskResponse:
@@ -235,9 +259,8 @@ async def handle_parse(event: TaskEvent) -> TaskEvent:
     try:
         if event.llm_logs is None:
             event.llm_logs = {}
-        callbacks = get_langfuse_callbacks()
         try:
-            parsed_data, llm_info = parse_with_llm(event.raw_text, callbacks)
+            parsed_data, llm_info = parse_with_llm(event.raw_text, trace_id=event.trace_id)
             event.llm_logs["parser"] = llm_info
         except Exception as llm_err:
             logger.error(f"LLM call failed: {llm_err}. Trying regex fallback...")

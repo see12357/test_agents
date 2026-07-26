@@ -5,10 +5,13 @@ Submits tasks, monitors agent pipeline, auto-approves human-in-the-loop,
 verifies production execution, and generates a structured summary table.
 """
 
+import os
 import time
 import requests
+from shared.config import load_config
 
-GATEWAY_URL = "http://localhost:8081"
+settings, _ = load_config()
+GATEWAY_URL = os.getenv("GATEWAY_URL", settings.gateway_url)
 
 TEST_PROMPTS = [
     (1, "PgBouncer Optimization", "Срочно на кластере pg-crm-prod провести оптимизацию пула соединений PgBouncer, обновить конфигурацию pgbouncer.ini и выполнить мягкий перезапуск без разрыва сессий пользователей. Время SLA - 20 минут."),
