@@ -24,7 +24,7 @@ def get_langfuse_client() -> Optional[object]:
     if _langfuse_client is None:
         try:
             from langfuse import Langfuse
-            host = os.getenv("LANGFUSE_BASE_URL", "http://langfuse-web:3000")
+            host = os.getenv("LANGFUSE_BASE_URL") or os.getenv("LANGFUSE_HOST") or "http://langfuse-web:3000"
             _langfuse_client = Langfuse(
                 public_key=public_key, secret_key=secret_key, host=host
             )

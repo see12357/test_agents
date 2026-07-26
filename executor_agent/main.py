@@ -557,6 +557,35 @@ logger.info(
 )
 
 
+def _run_production_with_span(task, reconstructed_state) -> dict:
+    """Helper to run production execution with optional Langfuse tracing span."""
+    from shared.tracing import get_langfuse_client
+    lf_client = get_langfuse_client()
+
+    if not lf_client or not task.task_id:
+        return run_production_node(reconstructed_state)
+
+    try:
+        from langfuse import propagate_attributes
+        input_payload = {
+            "task_id": task.task_id,
+            "target_object": task.parsed_data.object if task.parsed_data else "",
+            "script": task.sandbox_script
+        }
+        with lf_client.start_as_current_observation(as_type="span", name="Agent_Executor_Prod") as span:
+            with propagate_attributes(session_id=task.task_id, tags=["agent-executor", "prod-execution"]):
+                res = run_production_node(reconstructed_state)
+                span.update(
+                    input=input_payload,
+                    output={"status": res.get("status"), "report": res.get("report")}
+                )
+            lf_client.flush()
+        return res
+    except Exception as prod_tr_err:
+        logger.warning(f"Prod execution tracing note: {prod_tr_err}")
+        return run_production_node(reconstructed_state)
+
+
 @broker.subscriber(_APPROVAL_QUEUE)
 async def handle_prod_execution(event: TaskEvent) -> None:
     """
@@ -573,7 +602,7 @@ async def handle_prod_execution(event: TaskEvent) -> None:
         )
         return
 
-    is_sql = (
+    is_sql = bool(
         task.parsed_data and (
             "postgres" in task.parsed_data.object_type or
             "replica" in task.parsed_data.object_type or
@@ -599,34 +628,7 @@ async def handle_prod_execution(event: TaskEvent) -> None:
 
     try:
         logger.info(f"Executing verified script on production environment for Task [{task.task_id}]...")
-        
-        from shared.tracing import get_langfuse_client
-        lf_client = get_langfuse_client()
-
-        if lf_client and task.task_id:
-            try:
-                from langfuse import propagate_attributes
-                input_payload = {
-                    "task_id": task.task_id,
-                    "target_object": task.parsed_data.object if task.parsed_data else "",
-                    "script": task.sandbox_script
-                }
-                with lf_client.start_as_current_observation(as_type="span", name="Agent_Executor_Prod") as span:
-                    with propagate_attributes(session_id=task.task_id, tags=["agent-executor", "prod-execution"]):
-                        prod_result = run_production_node(reconstructed_state)
-                        span.update(
-                            input=input_payload,
-                            output={
-                                "status": prod_result.get("status"),
-                                "report": prod_result.get("report")
-                            }
-                        )
-                    lf_client.flush()
-            except Exception as prod_tr_err:
-                logger.warning(f"Prod execution tracing note: {prod_tr_err}")
-                prod_result = run_production_node(reconstructed_state)
-        else:
-            prod_result = run_production_node(reconstructed_state)
+        prod_result = _run_production_with_span(task, reconstructed_state)
         
         task.status = prod_result.get("status", "executed")
         task.report = prod_result.get("report")

@@ -5,6 +5,7 @@ CLI tool for submitting DBA tasks, tracking pipeline status, and handling operat
 import os
 import sys
 import time
+from typing import Optional, Tuple
 import requests
 from shared.config import load_config
 
@@ -54,7 +55,24 @@ def _print_rag_info(rag_context: str):
     print("    ...")
 
 
-def poll_task_pipeline(task_id: str, timeout_sec: int = 60, stop_at_hitl: bool = True) -> dict:
+def _evaluate_task_poll(resp, last_st: Optional[str], has_left_tested: bool) -> Tuple[Optional[dict], Optional[str], bool]:
+    """Helper to process task status poll response."""
+    if resp.status_code != 200:
+        return None, last_st, has_left_tested
+
+    task = resp.json()
+    st = task.get("status")
+    if st != last_st:
+        print(f"[*] Pipeline status: {last_st or 'PROCESSING'} -> [{st.upper()}]")
+        last_st = st
+    if st not in ("tested", "approved", "executed"):
+        has_left_tested = True
+    if has_left_tested and st in ("tested", "executed", "failed", "rejected"):
+        return task, last_st, has_left_tested
+    return None, last_st, has_left_tested
+
+
+def poll_task_pipeline(task_id: str, timeout_sec: int = 60) -> dict:
     """Polls task state after feedback until it transitions out of old 'tested' status and reaches new 'tested' state."""
     start = time.time()
     last_st = None
@@ -63,16 +81,9 @@ def poll_task_pipeline(task_id: str, timeout_sec: int = 60, stop_at_hitl: bool =
     while time.time() - start < timeout_sec:
         try:
             resp = requests.get(f"{GATEWAY_URL}/task/{task_id}", timeout=10)
-            if resp.status_code == 200:
-                task = resp.json()
-                st = task.get("status")
-                if st != last_st:
-                    print(f"[*] Pipeline status: {last_st or 'PROCESSING'} -> [{st.upper()}]")
-                    last_st = st
-                if st not in ("tested", "approved", "executed"):
-                    has_left_tested = True
-                if has_left_tested and st in ("tested", "executed", "failed", "rejected"):
-                    return task
+            res_task, last_st, has_left_tested = _evaluate_task_poll(resp, last_st, has_left_tested)
+            if res_task:
+                return res_task
         except Exception:
             pass
         time.sleep(1.5)
@@ -135,7 +146,32 @@ def _check_critical_confirmation(task_id: str) -> bool:
     return True
 
 
-def _handle_operator_approval(task_id: str, task: dict, auto_approve: bool = False) -> bool:
+def _run_interactive_edit_flow(task_id: str) -> None:
+    """Helper for operator interactive script edit or feedback flow."""
+    print("\n-----------------------------------------------------------------")
+    print("HUMAN-IN-THE-LOOP INTERACTIVE CORRECTION")
+    print("1. Provide feedback instructions for AI Agent correction")
+    print("2. Edit script text manually")
+    print("-----------------------------------------------------------------")
+    sub_choice = input("Select correction mode (1/2) [1]: ").strip()
+
+    success = _handle_manual_script_edit(task_id) if sub_choice == "2" else _handle_agent_feedback_edit(task_id)
+    if not success:
+        return
+
+    print("[*] Re-processing task in pipeline...")
+    updated_task = poll_task_pipeline(task_id)
+    if updated_task and updated_task.get("sandbox_script"):
+        print("\n--- UPDATED RE-TESTED SCRIPT ---")
+        print(updated_task["sandbox_script"].strip())
+        print("-" * 65)
+        if updated_task.get("sandbox_output"):
+            print("--- UPDATED SANDBOX TRIAL LOGS ---")
+            print(updated_task["sandbox_output"].strip())
+            print("-" * 65)
+
+
+def _handle_operator_approval(task_id: str, task: dict) -> bool:
     """
     Handles Human-In-The-Loop approval flow for generated scripts.
     Supports auto-approval for low risk, critical token confirmation,
@@ -178,34 +214,11 @@ def _handle_operator_approval(task_id: str, task: dict, auto_approve: bool = Fal
     # 3. STANDARD HITL APPROVAL for MEDIUM / HIGH Risk
     while True:
         choice = input("\nApprove script for production execution? (y: approve / n: reject / e: edit or feedback) [y]: ").strip().lower()
-        
-        # 3.1 EDIT OR PROVIDE FEEDBACK
-        if choice in ("e", "edit", "е"):
-            print("\n-----------------------------------------------------------------")
-            print("HUMAN-IN-THE-LOOP INTERACTIVE CORRECTION")
-            print("1. Provide feedback instructions for AI Agent correction")
-            print("2. Edit script text manually")
-            print("-----------------------------------------------------------------")
-            sub_choice = input("Select correction mode (1/2) [1]: ").strip()
-            
-            success = _handle_manual_script_edit(task_id) if sub_choice == "2" else _handle_agent_feedback_edit(task_id)
-            if not success:
-                continue
 
-            # Poll for re-tested task
-            print("[*] Re-processing task in pipeline...")
-            updated_task = poll_task_pipeline(task_id, stop_at_hitl=True)
-            if updated_task and updated_task.get("sandbox_script"):
-                print("\n--- UPDATED RE-TESTED SCRIPT ---")
-                print(updated_task["sandbox_script"].strip())
-                print("-" * 65)
-                if updated_task.get("sandbox_output"):
-                    print("--- UPDATED SANDBOX TRIAL LOGS ---")
-                    print(updated_task["sandbox_output"].strip())
-                    print("-" * 65)
+        if choice in ("e", "edit", "е"):
+            _run_interactive_edit_flow(task_id)
             continue
 
-        # 3.2 REJECT TASK
         if choice in ("n", "no", "net", "н", "нет"):
             try:
                 reject_resp = requests.post(f"{GATEWAY_URL}/task/{task_id}/reject", timeout=10)
@@ -215,11 +228,9 @@ def _handle_operator_approval(task_id: str, task: dict, auto_approve: bool = Fal
                 print(f"\n[X] Rejection API Request Error: {reject_err}")
             return False
 
-        # 3.3 APPROVE TASK
         if choice in ("", "y", "yes", "da", "д", "да"):
             break
 
-        # 3.4 UNRECOGNIZED INPUT
         print("[!] Unrecognized input. Please enter 'y' (approve), 'n' (reject), or 'e' (edit).")
 
     try:
@@ -319,7 +330,7 @@ def track_and_approve(task_id: str):
     }
 
     while _process_single_poll_tick(task_id, state):
-        pass
+        time.sleep(0.1)
 
 
 def main():

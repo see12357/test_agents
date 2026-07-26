@@ -66,8 +66,8 @@ class GigaChatAuth(httpx.Auth):
         yield request
 
     async def async_auth_flow(self, request):
-        request.headers["Authorization"] = f"Bearer {self.get_token()}"
-        yield request
+        for req in self.sync_auth_flow(request):
+            yield req
 
 
 def get_llm(settings: PlatformSettings, yaml_config=None) -> Tuple[BaseChatModel, str]:

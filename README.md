@@ -162,9 +162,14 @@ source .venv/bin/activate  # Для Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Теперь откройте файл `.env` в корневой папке проекта любым текстовым редактором и убедитесь, что там указаны правильные настройки:
+Создайте файл локальной конфигурации `.env` на основе шаблона `.env.example`:
+```bash
+cp .env.example .env
+```
+
+Затем откройте файл `.env` в корневой папке проекта любым текстовым редактором и заполните ваши доступы:
 ```ini
-# Выбираем провайдера (gigachat или deepseek)
+# Выбираем активного провайдера (gigachat или deepseek)
 LLM_PROVIDER=gigachat
 
 # Ключи для подключения к Sber GigaChat
