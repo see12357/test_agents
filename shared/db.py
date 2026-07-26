@@ -45,6 +45,10 @@ def init_db() -> None:
         cursor.execute("ALTER TABLE tasks ADD COLUMN llm_json TEXT")
     except Exception:
         pass
+    try:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN feedback TEXT")
+    except Exception:
+        pass
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS prompts (
@@ -76,12 +80,12 @@ def save_task(event: TaskEvent) -> None:
     cursor.execute("""
         INSERT OR REPLACE INTO tasks (
             task_id, raw_text, status, parsed_json, rag_context,
-            sandbox_script, sandbox_output, sandbox_exit_code, error_message, report, execution_output, llm_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            sandbox_script, sandbox_output, sandbox_exit_code, error_message, report, execution_output, llm_json, feedback
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         event.task_id, event.raw_text, event.status, parsed_str,
         event.rag_context, event.sandbox_script, event.sandbox_output,
-        event.sandbox_exit_code, event.error_message, event.report, event.execution_output, llm_str
+        event.sandbox_exit_code, event.error_message, event.report, event.execution_output, llm_str, event.feedback
     ))
     conn.commit()
     conn.close()
@@ -110,6 +114,7 @@ def get_task(task_id: str) -> Optional[TaskEvent]:
 
     execution_output = row[10] if len(row) > 10 else None
     llm_logs = json.loads(row[11]) if len(row) > 11 and row[11] else {}
+    feedback = row[12] if len(row) > 12 else None
 
     return TaskEvent(
         task_id=row[0],
@@ -123,7 +128,8 @@ def get_task(task_id: str) -> Optional[TaskEvent]:
         error_message=row[8],
         report=row[9],
         execution_output=execution_output,
-        llm_logs=llm_logs
+        llm_logs=llm_logs,
+        feedback=feedback
     )
 
 

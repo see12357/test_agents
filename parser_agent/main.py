@@ -188,6 +188,39 @@ def parse_with_llm(raw_text: str, callbacks: List) -> Tuple[ParseTaskResponse, d
     return ParseTaskResponse(**parsed_json), llm_info
 
 
+def _assign_risk_level(parsed: ParseTaskResponse, raw_text: str) -> ParseTaskResponse:
+    """Evaluates and assigns risk_level and requires_critical_confirmation."""
+    raw_lower = raw_text.lower()
+    critical_kw = ["drop", "truncate", "delete", "grant superuser", "revoke all", "rm -rf"]
+    if any(kw in raw_lower for kw in critical_kw):
+        risk = "CRITICAL"
+        req = True
+    elif parsed.action_type == "os_upgrade" or "reboot" in raw_lower or "upgrade" in raw_lower:
+        risk = "HIGH"
+        req = False
+    elif parsed.action_type == "compliance_audit" or ("select" in raw_lower and not parsed.is_downtime):
+        risk = "LOW"
+        req = False
+    else:
+        risk = "MEDIUM"
+        req = False
+
+    data = parsed.model_dump()
+    data["risk_level"] = risk
+    data["requires_critical_confirmation"] = req
+    return ParseTaskResponse(**data)
+
+
+def _validate_parsed_data(parsed_data: ParseTaskResponse) -> None:
+    """Validates parsed task data against configured allowed values."""
+    if parsed_data.object not in set(yaml_config.allowed_objects):
+        raise ValueError(f"Объект с ID '{parsed_data.object}' отсутствует в разрешенном справочнике.")
+    if parsed_data.object_type not in set(yaml_config.allowed_object_types):
+        raise ValueError(f"Тип объекта '{parsed_data.object_type}' недопустим.")
+    if parsed_data.priority not in set(yaml_config.allowed_priorities):
+        raise ValueError(f"Приоритет '{parsed_data.priority}' недопустим.")
+    if parsed_data.action_type not in set(yaml_config.allowed_actions):
+        raise ValueError(f"Тип действия '{parsed_data.action_type}' недопустим.")
 
 
 @broker.subscriber(_SUBSCRIBE_QUEUE)
@@ -211,34 +244,14 @@ async def handle_parse(event: TaskEvent) -> TaskEvent:
             parsed_data = parse_with_regex_fallback(event.raw_text)
             event.llm_logs["parser"] = {"fallback": "regex", "error": str(llm_err)}
 
-        allowed_objs = set(yaml_config.allowed_objects)
-        allowed_types = set(yaml_config.allowed_object_types)
-        allowed_priorities = set(yaml_config.allowed_priorities)
-        allowed_actions = set(yaml_config.allowed_actions)
-
+        parsed_data = _assign_risk_level(parsed_data, event.raw_text)
         logger.info("Running Input Guard validation...")
-
-        if parsed_data.object not in allowed_objs:
-            raise ValueError(
-                f"Объект с ID '{parsed_data.object}' отсутствует в разрешенном справочнике."
-            )
-        if parsed_data.object_type not in allowed_types:
-            raise ValueError(
-                f"Тип объекта '{parsed_data.object_type}' недопустим."
-            )
-        if parsed_data.priority not in allowed_priorities:
-            raise ValueError(
-                f"Приоритет '{parsed_data.priority}' недопустим."
-            )
-        if parsed_data.action_type not in allowed_actions:
-            raise ValueError(
-                f"Тип действия '{parsed_data.action_type}' недопустим."
-            )
+        _validate_parsed_data(parsed_data)
 
         event.parsed_data = parsed_data
         event.status = "parsed"
         logger.info(
-            f"[GUARD PASSED] Task [{event.task_id}] successfully validated!"
+            f"[GUARD PASSED] Task [{event.task_id}] validated! Risk Level: {parsed_data.risk_level} (Critical Confirmation: {parsed_data.requires_critical_confirmation})"
         )
 
     except Exception as err:

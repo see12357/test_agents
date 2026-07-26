@@ -82,8 +82,8 @@ def get_llm(settings: PlatformSettings) -> Tuple[BaseChatModel, str]:
     gigachat_creds = (os.getenv("GIGACHAT_CREDENTIALS") or getattr(settings, "gigachat_credentials", "") or "").strip()
     deepseek_key = (os.getenv("DEEPSEEK_API_KEY") or getattr(settings, "deepseek_api_key", "") or "").strip()
 
-    # 1. GigaChat Provider (Explicitly selected or credentials present)
-    if provider == "gigachat" or (gigachat_creds and gigachat_creds != "your_gigachat_credentials_here"):
+    # 1. GigaChat Provider (When explicitly selected via LLM_PROVIDER=gigachat)
+    if provider == "gigachat":
         gigachat_model = (os.getenv("GIGACHAT_MODEL") or getattr(settings, "gigachat_model", "GigaChat") or "GigaChat").strip()
         gigachat_base_url = (os.getenv("GIGACHAT_BASE_URL") or getattr(settings, "gigachat_base_url", "https://api.giga.chat/v1") or "https://api.giga.chat/v1").strip()
         scope = (os.getenv("GIGACHAT_SCOPE") or "GIGACHAT_API_PERS").strip()

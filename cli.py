@@ -54,8 +54,37 @@ def _print_rag_info(rag_context: str):
     print("    ...")
 
 
+def poll_task_pipeline(task_id: str, timeout_sec: int = 60, stop_at_hitl: bool = True) -> dict:
+    """Polls task state after feedback until it transitions out of old 'tested' status and reaches new 'tested' state."""
+    start = time.time()
+    last_st = None
+    has_left_tested = False
+
+    while time.time() - start < timeout_sec:
+        try:
+            resp = requests.get(f"{GATEWAY_URL}/task/{task_id}", timeout=10)
+            if resp.status_code == 200:
+                task = resp.json()
+                st = task.get("status")
+                if st != last_st:
+                    print(f"[*] Pipeline status: {last_st or 'PROCESSING'} -> [{st.upper()}]")
+                    last_st = st
+                if st not in ("tested", "approved", "executed"):
+                    has_left_tested = True
+                if has_left_tested and st in ("tested", "executed", "failed", "rejected"):
+                    return task
+        except Exception:
+            pass
+        time.sleep(1.5)
+    return {}
+
+
 def _handle_operator_approval(task_id: str, task: dict) -> bool:
-    """Displays sandbox output & prompt, handles operator approval/rejection. Returns True to continue, False to stop."""
+    """Displays sandbox output & prompt, handles multi-tier operator approval/rejection."""
+    parsed_data = task.get("parsed_data", {})
+    risk_level = parsed_data.get("risk_level", "MEDIUM") if parsed_data else "MEDIUM"
+    requires_critical = parsed_data.get("requires_critical_confirmation", False) if parsed_data else False
+
     print_header("STEP 3/4: EXECUTOR AGENT (Sandbox ReALF Trial Results)")
 
     if task.get("sandbox_output"):
@@ -65,28 +94,123 @@ def _handle_operator_approval(task_id: str, task: dict) -> bool:
 
     print_header("STEP 4/4: HUMAN-IN-THE-LOOP (Operator Approval Required)")
     print(f"Task ID: {task_id}")
+    print(f"Operation Risk Level: [{risk_level}]")
 
     if task.get("sandbox_script"):
         print("\n--- GENERATED SQL / BASH SCRIPT ---")
         print(task["sandbox_script"].strip())
         print("-" * 65)
 
-    choice = input("\nApprove script for production execution? (y/n) [y]: ").strip().lower()
-    is_rejected = choice.startswith("n") or choice.startswith("н") or choice.startswith("no")
-
-    if is_rejected:
+    # 1. AUTO-APPROVE for LOW Risk Operations
+    if risk_level == "LOW" and not requires_critical:
+        print("\n[AUTO-APPROVED]: Low-risk read/inspection operation. Executing on production automatically...")
         try:
-            reject_resp = requests.post(f"{GATEWAY_URL}/task/{task_id}/reject", timeout=10)
-            reject_resp.raise_for_status()
-            print("\n[X] Task REJECTED by operator.")
-        except Exception as reject_err:
-            print(f"\n[X] Rejection API Request Error: {reject_err}")
-        return False
+            approve_resp = requests.post(f"{GATEWAY_URL}/task/{task_id}/approve", timeout=10)
+            approve_resp.raise_for_status()
+        except Exception as approve_err:
+            print(f"\n[X] Auto-Approval API Error: {approve_err}")
+        return True
+
+    # 2. CRITICAL CONFIRMATION for Sensitive / Destructive Actions
+    if requires_critical or risk_level == "CRITICAL":
+        print("\n=================================================================")
+        print(" *** [CRITICAL SENSITIVE ACTION DETECTED] ***")
+        print(" WARNING: Script contains high-risk actions (DROP/TRUNCATE/DELETE/PRIVILEGES).")
+        print("=================================================================")
+        confirm_token = input("\nTo authorize this sensitive action, type 'CONFIRM-DESTRUCTIVE': ").strip()
+        
+        if confirm_token != "CONFIRM-DESTRUCTIVE":
+            print("\n[X] Critical confirmation token mismatch. Cancelling operation...")
+            try:
+                requests.post(f"{GATEWAY_URL}/task/{task_id}/reject", timeout=10)
+            except Exception:
+                pass
+            return False
+
+    # 3. STANDARD HITL APPROVAL for MEDIUM / HIGH Risk
+    while True:
+        choice = input("\nApprove script for production execution? (y: approve / n: reject / e: edit or feedback) [y]: ").strip().lower()
+        
+        # 3.1 EDIT OR PROVIDE FEEDBACK
+        if choice.startswith("e") or choice.startswith("е"):
+            print("\n-----------------------------------------------------------------")
+            print("HUMAN-IN-THE-LOOP INTERACTIVE CORRECTION")
+            print("1. Provide feedback instructions for AI Agent correction")
+            print("2. Edit script text manually")
+            print("-----------------------------------------------------------------")
+            sub_choice = input("Select correction mode (1/2) [1]: ").strip()
+            
+            if sub_choice == "2":
+                print("\nEnter or paste your modified script lines below (finish with line 'EOF'):")
+                lines = []
+                while True:
+                    line = input()
+                    if line.strip() == "EOF":
+                        break
+                    lines.append(line)
+                edited_code = "\n".join(lines)
+                if not edited_code.strip():
+                    print("[!] Empty script provided. Aborting edit.")
+                    continue
+                print("\n[*] Sending edited script to sandbox re-testing...")
+                try:
+                    resp = requests.post(
+                        f"{GATEWAY_URL}/task/{task_id}/feedback",
+                        json={"edited_script": edited_code},
+                        timeout=10
+                    )
+                    resp.raise_for_status()
+                except Exception as fb_err:
+                    print(f"[X] Feedback API Error: {fb_err}")
+                    continue
+            else:
+                user_fb = input("\nEnter feedback / correction instructions for agent: ").strip()
+                if not user_fb:
+                    print("[!] Empty feedback provided. Aborting.")
+                    continue
+                print("\n[*] Sending feedback to agent for script re-generation...")
+                try:
+                    resp = requests.post(
+                        f"{GATEWAY_URL}/task/{task_id}/feedback",
+                        json={"feedback": user_fb},
+                        timeout=10
+                    )
+                    resp.raise_for_status()
+                except Exception as fb_err:
+                    print(f"[X] Feedback API Error: {fb_err}")
+                    continue
+
+            # Poll for re-tested task
+            print("[*] Re-processing task in pipeline...")
+            updated_task = poll_task_pipeline(task_id, stop_at_hitl=True)
+            if updated_task and updated_task.get("sandbox_script"):
+                print("\n--- UPDATED RE-TESTED SCRIPT ---")
+                print(updated_task["sandbox_script"].strip())
+                print("-" * 65)
+                if updated_task.get("sandbox_output"):
+                    print("--- UPDATED SANDBOX TRIAL LOGS ---")
+                    print(updated_task["sandbox_output"].strip())
+                    print("-" * 65)
+            continue
+
+        # 3.2 REJECT TASK
+        is_rejected = choice.startswith("n") or choice.startswith("н") or choice.startswith("no")
+        if is_rejected:
+            try:
+                reject_resp = requests.post(f"{GATEWAY_URL}/task/{task_id}/reject", timeout=10)
+                reject_resp.raise_for_status()
+                print("\n[X] Task REJECTED by operator.")
+            except Exception as reject_err:
+                print(f"\n[X] Rejection API Request Error: {reject_err}")
+            return False
+
+        # 3.3 APPROVE TASK
+        break
 
     try:
         approve_resp = requests.post(f"{GATEWAY_URL}/task/{task_id}/approve", timeout=10)
         approve_resp.raise_for_status()
-        print("\n[✓] Task APPROVED! Sent to q.tasks.execute_prod queue.")
+        print("\n[OK] Task APPROVED! Sent to q.tasks.execute_prod queue.")
         print("[*] Executing script on target environment...")
     except Exception as approve_err:
         print(f"\n[X] Approval API Request Error: {approve_err}")

@@ -78,6 +78,14 @@ class ParseTaskResponse(BaseModel):
         default=False,
         description="Флаг необходимости остановки сервиса (простоя)"
     )
+    risk_level: str = Field(
+        default="MEDIUM",
+        description="Уровень риска операции (LOW, MEDIUM, HIGH, CRITICAL)"
+    )
+    requires_critical_confirmation: bool = Field(
+        default=False,
+        description="Флаг необходимости критического подтверждения для деструктивных действий"
+    )
 
     @field_validator('purpose', mode='before')
     @classmethod
@@ -102,6 +110,7 @@ class TaskEvent(BaseModel):
     error_message: Optional[str] = None
     report: Optional[str] = None
     execution_output: Optional[str] = None
+    feedback: Optional[str] = None
     llm_logs: dict = Field(default_factory=dict)
 
     @field_validator('llm_logs', mode='before')

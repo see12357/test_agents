@@ -36,7 +36,7 @@ def poll_status(task_id, timeout_sec=120):
             st = data.get("status")
             if st != last_status:
                 last_status = st
-            if st == "tested":
+            if st in ("tested", "human_approval_required"):
                 try:
                     requests.post(f"{GATEWAY_URL}/task/{task_id}/approve", timeout=30)
                 except Exception:

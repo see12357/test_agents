@@ -8,6 +8,7 @@ Strictly PEP 8 compliant.
 import logging
 import os
 import uuid
+from typing import Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status
 from faststream.rabbit import RabbitBroker
@@ -194,6 +195,60 @@ async def reject_task(task_id: str):
         "task_id": task_id,
         "status": "rejected"
     }
+
+
+class TaskFeedbackRequest(BaseModel):
+    feedback: Optional[str] = Field(
+        None,
+        description="Замечания или инструкции по изменению логики"
+    )
+    edited_script: Optional[str] = Field(
+        None,
+        description="Отредактированный вручную текст скрипта"
+    )
+
+
+@app.post(
+    "/task/{task_id}/feedback",
+    summary="Provide human feedback or edited script for re-evaluation"
+)
+async def provide_task_feedback(task_id: str, request: TaskFeedbackRequest):
+    """
+    Allows human operator to provide feedback instructions or direct script edits.
+    """
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task with ID '{task_id}' not found"
+        )
+        
+    if request.edited_script:
+        logger.info(f"Human-in-the-loop: task [{task_id}] updated with manual script edit")
+        task.sandbox_script = request.edited_script
+        task.status = "enriched"
+        save_task(task)
+        await broker.publish(task, queue="q.tasks.ready_for_execution")
+        return {
+            "task_id": task_id,
+            "status": "retesting_edited_script"
+        }
+        
+    if request.feedback:
+        logger.info(f"Human-in-the-loop: task [{task_id}] feedback received: '{request.feedback}'")
+        task.feedback = request.feedback
+        task.status = "enriched"
+        save_task(task)
+        await broker.publish(task, queue="q.tasks.ready_for_execution")
+        return {
+            "task_id": task_id,
+            "status": "regenerating_with_feedback"
+        }
+        
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Either 'feedback' or 'edited_script' must be provided"
+    )
 
 
 @app.get(

@@ -29,7 +29,7 @@ class PlatformSettings(BaseSettings):
 
     # GigaChat (Sber) configuration
     gigachat_credentials: str = Field(default="")
-    gigachat_model: str = Field(default="GigaChat")
+    gigachat_model: str = Field(default="GigaChat-3-Ultra")
     gigachat_base_url: str = Field(default="https://gigachat.devices.sberbank.ru/api/v1")
     gigachat_verify_ssl_certs: bool = Field(default=False)
 
@@ -77,6 +77,7 @@ class YAMLConfig(BaseModel):
     parser_prompt: str = ""
     rag_prompt: str = ""
     executor_prompt: str = ""
+    executor_rules: dict = Field(default_factory=dict)
     executor_max_retries: int = 3
 
     def get_pipeline_step(self, name: str) -> Optional[PipelineStep]:
@@ -146,6 +147,11 @@ def load_config() -> Tuple[PlatformSettings, YAMLConfig]:
                 raw_yaml.get("agents", {})
                 .get("executor", {})
                 .get("prompt", "")
+            )
+            yaml_data["executor_rules"] = (
+                raw_yaml.get("agents", {})
+                .get("executor", {})
+                .get("rules", {})
             )
             yaml_data["executor_max_retries"] = (
                 raw_yaml.get("agents", {})

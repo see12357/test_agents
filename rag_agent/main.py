@@ -144,6 +144,38 @@ SUBSCRIBE_QUEUE = rag_step.subscribe_queue if rag_step else "q.tasks.parsed"
 PUBLISH_QUEUE = rag_step.publish_queue if rag_step else "q.tasks.ready_for_execution"
 
 
+def _retrieve_chromadb_context(search_query: str) -> str:
+    """Retrieves and reranks document candidates from ChromaDB."""
+    if db is None:
+        return local_rag_fallback(search_query, reason="ChromaDB client uninitialized")
+
+    initial_k = yaml_config.rag_initial_candidates
+    top_k = yaml_config.rag_reranker_top_k
+
+    candidates = db.similarity_search(search_query, k=initial_k)
+    logger.info(f"ChromaDB initial vector search returned {len(candidates)} candidates (config limit: {initial_k})")
+    
+    if not candidates:
+        logger.info("ChromaDB returned 0 matches, running local manual keyword fallback...")
+        return local_rag_fallback(search_query, reason="ChromaDB returned 0 matches")
+
+    if reranker is not None:
+        pairs = [[search_query, doc.page_content] for doc in candidates]
+        scores = reranker.predict(pairs)
+        scored_candidates = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+        results = [doc for score, doc in scored_candidates[:top_k]]
+        for score, doc in scored_candidates[:top_k]:
+            logger.info(f"[RERANKER {yaml_config.rag_reranker_model}] Score: {float(score):.4f} | Source: {doc.metadata.get('source')}")
+    else:
+        results = candidates[:top_k]
+
+    manuals = [
+        f"--- Manual {i+1} (Source: {doc.metadata.get('source', 'unknown')}) ---\n{doc.page_content}"
+        for i, doc in enumerate(results)
+    ]
+    return "\n\n".join(manuals)
+
+
 @broker.subscriber(SUBSCRIBE_QUEUE)
 @broker.publisher(PUBLISH_QUEUE)
 async def handle_rag_enrichment(event: TaskEvent) -> TaskEvent:
@@ -176,42 +208,9 @@ async def handle_rag_enrichment(event: TaskEvent) -> TaskEvent:
     logger.info(f"Constructed RAG search query: '{search_query}'")
 
     try:
-        if db is not None:
-            initial_k = yaml_config.rag_initial_candidates
-            top_k = yaml_config.rag_reranker_top_k
-
-            candidates = db.similarity_search(search_query, k=initial_k)
-            logger.info(f"ChromaDB initial vector search returned {len(candidates)} candidates (config limit: {initial_k})")
-            
-            if candidates and reranker is not None:
-                pairs = [[search_query, doc.page_content] for doc in candidates]
-                scores = reranker.predict(pairs)
-                scored_candidates = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-                results = [doc for score, doc in scored_candidates[:top_k]]
-                for score, doc in scored_candidates[:top_k]:
-                    logger.info(f"[RERANKER {yaml_config.rag_reranker_model}] Score: {float(score):.4f} | Source: {doc.metadata.get('source')}")
-            else:
-                results = candidates[:top_k]
-
-            manuals = []
-            for i, doc in enumerate(results):
-                source = doc.metadata.get("source", "unknown")
-                manuals.append(
-                    f"--- Manual {i+1} (Source: {source}) ---\n{doc.page_content}"
-                )
-            if manuals:
-                event.rag_context = "\n\n".join(manuals)
-            else:
-                logger.info("ChromaDB returned 0 matches, running local manual keyword fallback...")
-                event.rag_context = local_rag_fallback(search_query, reason="ChromaDB returned 0 matches")
-        else:
-            event.rag_context = local_rag_fallback(search_query, reason="ChromaDB client uninitialized")
-            
+        event.rag_context = _retrieve_chromadb_context(search_query)
         event.status = "enriched"
-        logger.info(
-            f"[RAG SUCCESS] Task [{event.task_id}] enriched with documentation!"
-        )
-
+        logger.info(f"[RAG SUCCESS] Task [{event.task_id}] enriched with documentation!")
     except Exception as err:
         logger.warning(f"ChromaDB retrieval error: {err}. Running local fallback...")
         try:
