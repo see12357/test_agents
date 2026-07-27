@@ -130,10 +130,10 @@ def _handle_agent_feedback_edit(task_id: str) -> bool:
 
 def _check_critical_confirmation(task_id: str) -> bool:
     """Enforces strict CONFIRM-DESTRUCTIVE token entry for high-risk operations."""
-    print("\n=================================================================")
+    print("\n-----------------------------------------------------------------")
     print(" *** [CRITICAL SENSITIVE ACTION DETECTED] ***")
     print(" WARNING: Script contains high-risk actions (DROP/TRUNCATE/DELETE/PRIVILEGES).")
-    print("=================================================================")
+    print("-----------------------------------------------------------------")
     confirm_token = input("\nTo authorize this sensitive action, type 'CONFIRM-DESTRUCTIVE': ").strip()
     
     if confirm_token != "CONFIRM-DESTRUCTIVE":

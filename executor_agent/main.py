@@ -592,7 +592,7 @@ async def handle_prod_execution(event: TaskEvent) -> None:
     FastStream consumer for approved tasks. Runs Production execution & compiles final report.
     """
     logger.info(
-        f"=== [EXECUTOR PROD STEP] Human Approval Received for Task [{event.task_id}] ==="
+        f"[EXECUTOR PROD STEP] Human Approval Received for Task [{event.task_id}]"
     )
 
     task = get_task(event.task_id)
