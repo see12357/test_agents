@@ -21,10 +21,10 @@ class GigaChatAuth(httpx.Auth):
     Custom HTTPX Auth class for GigaChat OAuth token management.
     """
     def __init__(self, credentials: str, scope: str = "GIGACHAT_API_PERS", verify_ssl: bool = False, auth_url: str = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth", timeout: float = 45.0):
-        self.credentials = credentials
-        self.scope = scope
+        self.credentials = credentials.strip()
+        self.scope = scope.strip()
         self.verify_ssl = verify_ssl
-        self.auth_url = auth_url
+        self.auth_url = auth_url.strip()
         self.timeout = timeout
         self.token = ""
         self.expires_at = 0.0
@@ -48,7 +48,11 @@ class GigaChatAuth(httpx.Auth):
             verify=self.verify_ssl,
             timeout=self.timeout
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"GigaChat OAuth error HTTP {resp.status_code}: {resp.text.strip()} "
+                f"(Verify GIGACHAT_CREDENTIALS and GIGACHAT_SCOPE={self.scope} in .env)"
+            )
         data = resp.json()
 
         self.token = data.get("access_token", "")
@@ -91,7 +95,7 @@ def get_llm(settings: PlatformSettings, yaml_config=None) -> Tuple[BaseChatModel
         gigachat_base_url = (os.getenv("GIGACHAT_BASE_URL") or getattr(settings, "gigachat_base_url", "https://api.giga.chat/v1") or "https://api.giga.chat/v1").strip()
         scope = (os.getenv("GIGACHAT_SCOPE") or "GIGACHAT_API_PERS").strip()
         verify_ssl = getattr(settings, "gigachat_verify_ssl_certs", False)
-        gigachat_auth_url = getattr(settings, "gigachat_auth_url", "https://ngw.devices.sberbank.ru:9443/api/v2/oauth")
+        gigachat_auth_url = (os.getenv("GIGACHAT_AUTH_URL") or getattr(settings, "gigachat_auth_url", "https://ngw.devices.sberbank.ru:9443/api/v2/oauth") or "https://ngw.devices.sberbank.ru:9443/api/v2/oauth").strip()
         llm_timeout = getattr(settings, "llm_timeout", 45.0)
         llm_temp = getattr(settings, "llm_temperature", 0.0)
 
