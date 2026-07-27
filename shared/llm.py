@@ -86,16 +86,16 @@ def get_llm(settings: PlatformSettings, yaml_config=None) -> Tuple[BaseChatModel
         or (getattr(yaml_config, "llm_provider", "") if yaml_config else "")
         or getattr(settings, "llm_provider", "gigachat")
     ).lower().strip()
-    gigachat_creds = (os.getenv("GIGACHAT_CREDENTIALS") or getattr(settings, "gigachat_credentials", "") or "").strip()
-    deepseek_key = (os.getenv("DEEPSEEK_API_KEY") or getattr(settings, "deepseek_api_key", "") or "").strip()
+    gigachat_creds = (os.getenv("GIGACHAT_CREDENTIALS") or getattr(settings, "gigachat_credentials", "") or "").strip(' \t\r\n\'"')
+    deepseek_key = (os.getenv("DEEPSEEK_API_KEY") or getattr(settings, "deepseek_api_key", "") or "").strip(' \t\r\n\'"')
 
     # 1. GigaChat Provider (When explicitly selected via LLM_PROVIDER=gigachat)
     if provider == "gigachat":
-        gigachat_model = (os.getenv("GIGACHAT_MODEL") or getattr(settings, "gigachat_model", "GigaChat") or "GigaChat").strip()
-        gigachat_base_url = (os.getenv("GIGACHAT_BASE_URL") or getattr(settings, "gigachat_base_url", "https://api.giga.chat/v1") or "https://api.giga.chat/v1").strip()
-        scope = (os.getenv("GIGACHAT_SCOPE") or "GIGACHAT_API_PERS").strip()
+        gigachat_model = (os.getenv("GIGACHAT_MODEL") or getattr(settings, "gigachat_model", "GigaChat") or "GigaChat").strip(' \t\r\n\'"')
+        gigachat_base_url = (os.getenv("GIGACHAT_BASE_URL") or getattr(settings, "gigachat_base_url", "https://api.giga.chat/v1") or "https://api.giga.chat/v1").strip(' \t\r\n\'"')
+        scope = (os.getenv("GIGACHAT_SCOPE") or "GIGACHAT_API_PERS").strip(' \t\r\n\'"')
         verify_ssl = getattr(settings, "gigachat_verify_ssl_certs", False)
-        gigachat_auth_url = (os.getenv("GIGACHAT_AUTH_URL") or getattr(settings, "gigachat_auth_url", "https://ngw.devices.sberbank.ru:9443/api/v2/oauth") or "https://ngw.devices.sberbank.ru:9443/api/v2/oauth").strip()
+        gigachat_auth_url = (os.getenv("GIGACHAT_AUTH_URL") or getattr(settings, "gigachat_auth_url", "https://ngw.devices.sberbank.ru:9443/api/v2/oauth") or "https://ngw.devices.sberbank.ru:9443/api/v2/oauth").strip(' \t\r\n\'"')
         llm_timeout = getattr(settings, "llm_timeout", 45.0)
         llm_temp = getattr(settings, "llm_temperature", 0.0)
 
