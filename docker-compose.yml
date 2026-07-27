@@ -67,6 +67,8 @@ services:
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-pk-lf-demo}
       - LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL:-http://langfuse-web:3000}
       - HF_HOME=/app/.hf_cache
+      - LLM_PROVIDER=${LLM_PROVIDER:-gigachat}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:

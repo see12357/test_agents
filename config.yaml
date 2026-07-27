@@ -1,5 +1,5 @@
 platform:
-  llm_provider: "gigachat"
+  llm_provider: "deepseek"
   embedding_model: "intfloat/multilingual-e5-large"
   retry_delay_seconds: 2
   execution_timeout_seconds: 15

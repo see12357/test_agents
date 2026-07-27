@@ -83,9 +83,10 @@ def get_llm(settings: PlatformSettings, yaml_config=None) -> Tuple[BaseChatModel
     """
     provider = (
         os.getenv("LLM_PROVIDER")
+        or getattr(settings, "llm_provider", "")
         or (getattr(yaml_config, "llm_provider", "") if yaml_config else "")
-        or getattr(settings, "llm_provider", "gigachat")
-    ).lower().strip()
+        or "deepseek"
+    ).lower().strip(' \t\r\n\'"')
     gigachat_creds = (os.getenv("GIGACHAT_CREDENTIALS") or getattr(settings, "gigachat_credentials", "") or "").strip(' \t\r\n\'"')
     deepseek_key = (os.getenv("DEEPSEEK_API_KEY") or getattr(settings, "deepseek_api_key", "") or "").strip(' \t\r\n\'"')
 

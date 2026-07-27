@@ -39,8 +39,13 @@ app = FastStream(broker)
 
 from shared.llm import get_llm
 
-llm, provider_info = get_llm(settings)
-logger.info(f"ExecutorAgent initialized LLM provider: {provider_info}")
+llm = None
+provider_info = "uninitialized"
+try:
+    llm, provider_info = get_llm(settings)
+except Exception as e:
+    logger.warning(f"LLM init failed at startup (will retry on first request): {e}")
+logger.info(f"ExecutorAgent LLM provider: {provider_info}")
 
 
 # --- LangGraph State Definition (Pydantic BaseModel) ---
