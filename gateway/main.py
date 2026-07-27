@@ -113,13 +113,20 @@ async def submit_task(request: TaskSubmitRequest):
     if langfuse_client:
         try:
             clean_id = task_id.replace("-", "").lower()[:32]
-            langfuse_client.trace(
-                id=clean_id,
-                name=f"DBA_Pipeline_{task_id[:8]}",
+            from langfuse import propagate_attributes
+            with propagate_attributes(
                 session_id=task_id,
-                input={"raw_text": request.text},
-                tags=["dba-pipeline"]
-            )
+                tags=["dba-pipeline"],
+                trace_name=f"DBA_Pipeline_{task_id[:8]}"
+            ):
+                with langfuse_client.start_as_current_observation(
+                    trace_context={"trace_id": clean_id},
+                    name=f"DBA_Pipeline_{task_id[:8]}",
+                    as_type="span",
+                    input={"raw_text": request.text},
+                    metadata={"task_id": task_id}
+                ) as span:
+                    span.update(output={"status": "submitted"})
             langfuse_client.flush()
         except Exception as trace_err:
             logger.warning(f"Could not init Langfuse trace: {trace_err}")
