@@ -47,8 +47,8 @@ try:
         coll = chroma_client.get_collection(collection_name)
         if coll.count() == 0:
             logger.info(f"ChromaDB collection '{collection_name}' is empty. Auto-running chunker...")
-            from chunker import main as seed_main
-            seed_main()
+            from chunker import seed_database
+            seed_database(preview_only=False)
     except Exception as seed_err:
         logger.warning(f"Auto-seeding check note: {seed_err}")
 except Exception as e:
