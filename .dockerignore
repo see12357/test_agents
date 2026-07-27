@@ -6,7 +6,16 @@ __pycache__
 *.pyo
 *.pyd
 .pytest_cache
+.sonar
+.idea
+.vscode
+.DS_Store
+.hf_cache
+chroma-data/
+chroma_db/
 *.gguf
 *.dump
 logs
 executor.db
+*.db
+*.sqlite
